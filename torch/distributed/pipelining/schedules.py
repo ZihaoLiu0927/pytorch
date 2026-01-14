@@ -21,9 +21,69 @@ from torch.distributed.fsdp import FSDPModule, UnshardHandle
 from torch.nn.modules.loss import _Loss
 from torch.profiler import record_function
 
-from ._utils import generate_rank_to_stage_mapping, generate_stage_to_rank_mapping
+from ._utils import (
+    generate_rank_to_stage_mapping,
+    generate_stage_to_rank_mapping,
+    InferenceMode,
+    PipeliningMetadataError,
+)
 from .microbatch import merge_chunks, split_args_kwargs_into_chunks, TensorChunkSpec
-from .stage import _PipelineStageBase
+from .stage import _PipelineStageBase, PipelineStage
+
+
+def _determine_and_set_global_inference_mode(
+    stages: list[PipelineStage],
+    has_backward: bool,
+) -> None:
+    """Determine global inference mode via all-reduce across PP ranks.
+
+    If any stage (locally or remotely) needs ``DYNAMIC``, all stages
+    use ``DYNAMIC``.
+
+    Args:
+        stages: Pipeline stages on this rank.
+        has_backward: Whether a backward pass will be performed.
+    """
+    needs_dynamic = any(
+        InferenceMode.needs_dynamic(stage._user_meta, has_backward) for stage in stages
+    )
+
+    vote = torch.tensor(
+        [1 if needs_dynamic else 0],
+        dtype=torch.int32,
+        device=stages[0].device,
+    )
+    dist.all_reduce(vote, op=dist.ReduceOp.MAX, group=stages[0].group)
+
+    global_mode = InferenceMode.DYNAMIC if vote.item() else InferenceMode.STATIC
+
+    for stage in stages:
+        stage._inference_mode = global_mode
+
+    if global_mode == InferenceMode.DYNAMIC:
+        missing_get_mesh = any(stage.get_mesh is None for stage in stages)
+        missing_vote = torch.tensor(
+            [1 if missing_get_mesh else 0],
+            dtype=torch.int32,
+            device=stages[0].device,
+        )
+        dist.all_reduce(missing_vote, op=dist.ReduceOp.MAX, group=stages[0].group)
+        if missing_vote.item():
+            rank = dist.get_rank(stages[0].group)
+            missing_stage_indices = [
+                stage.stage_index for stage in stages if stage.get_mesh is None
+            ]
+            raise PipeliningMetadataError(
+                "Global inference_mode=DYNAMIC requires get_mesh to be set on every "
+                "PipelineStage before schedule initialization. "
+                f"rank={rank}, local_missing_stage_indices={missing_stage_indices}"
+            )
+
+    logger.debug(
+        "Rank determined inference_mode=%s for %d stage(s)",
+        global_mode.value,
+        len(stages),
+    )
 
 
 __all__ = [
@@ -543,7 +603,7 @@ class PipelineScheduleSingle(_PipelineSchedule):
             self._get_pipeline_order()
         )
 
-    def _initialize_stage(self, args, kwargs):
+    def _initialize_stage(self, args, kwargs, target=None):
         if not self._stage_forward_initialized:
             # Prepare the communication needed for the pipeline schedule execution
             # This is needed because during execution we always perform a series of batch P2P ops
@@ -552,12 +612,29 @@ class PipelineScheduleSingle(_PipelineSchedule):
             all_ops.extend(self._stage._get_init_p2p_neighbors_ops())
             _wait_batch_p2p(_batch_p2p(all_ops))
 
-            self._stage._prepare_forward_infra(self._n_microbatches, args, kwargs)
+            # Determine global inference mode via collective across all PP ranks
+            if isinstance(self._stage, PipelineStage):
+                _determine_and_set_global_inference_mode(
+                    [self._stage], self._has_backward
+                )
+
+            # Phase 1: Forward metadata inference
+            self._stage._prepare_forward_infra(
+                self._n_microbatches,
+                args,
+                kwargs,
+                has_backward=self._has_backward,
+            )
             self._stage_forward_initialized = True
 
-        if self._has_backward and not self._stage_backward_initialized:
-            self._stage._prepare_backward_infra(self._n_microbatches)
-            self._stage_backward_initialized = True
+            # Phase 2: Backward metadata inference (always done separately)
+            if self._has_backward:
+                self._stage._prepare_backward_infra(
+                    self._n_microbatches,
+                    loss_fn=self._loss_fn,
+                    target=target,
+                )
+                self._stage_backward_initialized = True
 
     def step(
         self,
@@ -653,7 +730,8 @@ class _ScheduleForwardOnly(PipelineScheduleSingle):
             )
 
         arg_mbs, kwarg_mbs = self._check_inputs(arg_mbs, kwarg_mbs, target_mbs, losses)
-        self._initialize_stage(arg_mbs[0], kwarg_mbs[0])
+        first_target = target_mbs[0] if target_mbs is not None else None
+        self._initialize_stage(arg_mbs[0], kwarg_mbs[0], first_target)
 
         # Delay send waits
         fwd_sends_to_wait: list[list[dist.Work]] = []
@@ -704,7 +782,8 @@ class ScheduleGPipe(PipelineScheduleSingle):
             return_outputs: whether to return the outputs from the last stage.
         """
         arg_mbs, kwarg_mbs = self._check_inputs(arg_mbs, kwarg_mbs, target_mbs, losses)
-        self._initialize_stage(arg_mbs[0], kwarg_mbs[0])
+        first_target = target_mbs[0] if target_mbs is not None else None
+        self._initialize_stage(arg_mbs[0], kwarg_mbs[0], first_target)
 
         # Delay send waits
         fwd_sends_to_wait: list[list[dist.Work]] = []
@@ -848,7 +927,8 @@ or equal to the number of stages ({self._num_stages})."
             return_outputs: whether to return the outputs from the last stage.
         """
         arg_mbs, kwarg_mbs = self._check_inputs(arg_mbs, kwarg_mbs, target_mbs, losses)
-        self._initialize_stage(arg_mbs[0], kwarg_mbs[0])
+        first_target = target_mbs[0] if target_mbs is not None else None
+        self._initialize_stage(arg_mbs[0], kwarg_mbs[0], first_target)
 
         # Last stage has 1 warmup, second-to-last 2 warmups, ...
         # first stage `num_stages` warmups
@@ -1515,7 +1595,7 @@ class PipelineScheduleMulti(_PipelineSchedule):
                 "Simply stop passing it, and everything should still work fine."
             )
 
-    def _initialize_stages(self, args: tuple[Any, ...], kwargs):
+    def _initialize_stages(self, args: tuple[Any, ...], kwargs, target=None):
         if not self._stages_forward_initialized:
             # Prepare the communication needed for the pipeline schedule execution
             # This is needed because during execution we always perform a series of batch P2P ops
@@ -1525,24 +1605,47 @@ class PipelineScheduleMulti(_PipelineSchedule):
                 all_ops.extend(stage._get_init_p2p_neighbors_ops())
             _wait_batch_p2p(_batch_p2p(all_ops))
 
-            # may be 'none' value (if this stage sends its output shapes to the next stage via P2P)
-            # or real value (if this stage and next stage are on the same device)
-            next_stage_args: tuple[Any, ...] = tuple()
+            # Determine global inference mode via collective across all PP ranks
+            if all(isinstance(stage, PipelineStage) for stage in self._stages):
+                _determine_and_set_global_inference_mode(
+                    cast(list[PipelineStage], self._stages), self._has_backward
+                )
+
+            # Phase 1 (Forward): Prepare forward infrastructure for all stages
+            # Forward metadata flows from Stage 0 → Stage N
+            # Backward phase is always handled separately in Phase 2
+            next_stage_args: Any = None
             for stage in self._stages:
                 if stage.is_first:
                     next_stage_args = stage._prepare_forward_infra(
-                        self._n_microbatches, args, kwargs
+                        self._n_microbatches,
+                        args,
+                        kwargs,
+                        has_backward=self._has_backward,
                     )
                 else:
                     next_stage_args = stage._prepare_forward_infra(
-                        self._n_microbatches, next_stage_args, kwargs
+                        self._n_microbatches,
+                        next_stage_args,
+                        kwargs,
+                        has_backward=self._has_backward,
                     )
             self._stages_forward_initialized = True
 
-        if self._has_backward and not self._stages_backward_initialized:
-            for stage in self._stages:
-                stage._prepare_backward_infra(self._n_microbatches)
-            self._stages_backward_initialized = True
+            # Phase 2 (Backward): If backward is needed, run backward phase in REVERSE order
+            # Backward metadata flows from Stage N → Stage 0
+            if self._has_backward:
+                # Iterate stages in reverse order
+                prev_stage_grad_meta: Any = None
+                for stage in reversed(self._stages):
+                    # Call _prepare_backward_infra which handles both metadata inference and recv info setup
+                    prev_stage_grad_meta = stage._prepare_backward_infra(
+                        self._n_microbatches,
+                        loss_fn=self._loss_fn,
+                        target=target,
+                        received_grad_meta=prev_stage_grad_meta,  # Pass grad meta from next stage
+                    )
+                self._stages_backward_initialized = True
 
     def _validate_and_set_stage_mapping(
         self, actions: dict[int, list[_Action | None]]
@@ -1657,8 +1760,8 @@ class PipelineScheduleMulti(_PipelineSchedule):
         not support models with skip connections.
         """
         arg_mbs, kwarg_mbs = self._check_inputs(arg_mbs, kwarg_mbs, target_mbs, losses)
-
-        self._initialize_stages(arg_mbs[0], kwarg_mbs[0])
+        first_target = target_mbs[0] if target_mbs is not None else None
+        self._initialize_stages(arg_mbs[0], kwarg_mbs[0], first_target)
 
         # Based on the plan in Step 1 created in __init__:
         # 2. Perform communication based on the pipeline_order
@@ -2043,7 +2146,8 @@ class _PipelineScheduleRuntime(PipelineScheduleMulti):
         not support models with skip connections.
         """
         arg_mbs, kwarg_mbs = self._check_inputs(arg_mbs, kwarg_mbs, target_mbs, losses)
-        self._initialize_stages(arg_mbs[0], kwarg_mbs[0])
+        first_target = target_mbs[0] if target_mbs is not None else None
+        self._initialize_stages(arg_mbs[0], kwarg_mbs[0], first_target)
 
         # Based on the plan in Step 1 created in __init__:
         # 2. Perform communication based on the pipeline_order
