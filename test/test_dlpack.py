@@ -13,7 +13,6 @@ from torch.testing._internal.common_device_type import (
     onlyOn,
     skipCUDAIfNotRocm,
     skipMeta,
-    skipXPUIf,
 )
 from torch.testing._internal.common_dtype import (
     all_mps_types_and,
@@ -123,7 +122,7 @@ class TestTorchDlPack(TestCase):
     def test_dlpack_conversion_with_streams(self, device, dtype):
         # Create a stream where the tensor will reside
         stream = torch.Stream()
-        with stream:
+        with torch.get_device_module(device_type).stream(stream):
             # Do an operation in the actual stream
             x = make_tensor((5,), dtype=dtype, device=device) + 1
         z = self._dlpack_conversion_with_streams(stream, x)
@@ -141,7 +140,7 @@ class TestTorchDlPack(TestCase):
     )
     def test_dlpack_conversion_with_streams_narrow_precision(self, device, dtype):
         stream = torch.Stream()
-        with stream:
+        with torch.get_device_module(device_type).stream(stream):
             x = make_tensor((5,), dtype=torch.uint8, device=device) + 1
             x = x.view(dtype)
         z = self._dlpack_conversion_with_streams(stream, x)
@@ -215,7 +214,7 @@ class TestTorchDlPack(TestCase):
         # (hence data dependency) at the exchange boundary.
         # the `tensor.__dlpack__` method will insert a synchronization event
         # in the current stream to make sure that it was correctly populated.
-        with stream_a:
+        with torch.get_device_module(device_type).stream(stream_a):
             x = make_tensor((5,), dtype=dtype, device=device) + 1
             z = torch.from_dlpack(x.__dlpack__(stream=stream_b.cuda_stream))
             stream_a.synchronize()
@@ -235,7 +234,7 @@ class TestTorchDlPack(TestCase):
     def test_dlpack_conversion_with_diff_streams_narrow_precision(self, device, dtype):
         stream_a = torch.Stream()
         stream_b = torch.Stream()
-        with stream_a:
+        with torch.get_device_module(device_type).stream(stream_a):
             x = make_tensor((5,), dtype=torch.uint8, device=device) + 1
             x = x.view(dtype)
             z = torch.from_dlpack(x.__dlpack__(stream=stream_b.cuda_stream))
