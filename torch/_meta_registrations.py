@@ -2587,15 +2587,88 @@ def meta_miopen_batch_norm(
     return out, save_mean, save_var
 
 
-def _conv_memory_format_for(*tensors: torch.Tensor) -> torch.memory_format:
-    """Infer the output memory format for convolution from its input tensors."""
-    for t in tensors:
-        fmt = suggest_memory_format(t)
-        if fmt == torch.channels_last:
+def _determine_conv_memory_format(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    dilation: list[int],
+    transposed: bool,
+    output_padding: list[int],
+    groups: int,
+    bias_sizes: list[int] | None = None,
+) -> torch.memory_format | None:
+    """Query the actual backend to determine the output memory format for a conv.
+
+    Returns None when shapes contain unbacked SymInts (no hint available),
+    in which case the caller should fall back to contiguous.
+    """
+    from torch.fx.experimental.symbolic_shapes import has_guarding_hint
+
+    if not (
+        all(has_guarding_hint(s) for s in input.shape)
+        and all(has_guarding_hint(s) for s in weight.shape)
+    ):
+        return None
+
+    select_kwargs: dict[str, object] = dict(
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        transposed=transposed,
+        output_padding=output_padding,
+        groups=groups,
+    )
+    select_kwargs["bias"] = bias
+    if bias is None:
+        select_kwargs["bias_sizes"] = bias_sizes
+    conv_backend = torch._C._select_conv_backend(input, weight, **select_kwargs)
+
+    # On meta device, _select_conv_backend returns Overrideable which makes
+    # _conv_determine_backend_memory_format always return contiguous. Fall back
+    # to inferring from the input/weight memory format instead (real backends
+    # like MKL-DNN use channels_last when either input or weight is channels_last).
+    # pyrefly: ignore[missing-attribute]
+    if conv_backend == torch._C._ConvBackend.Overrideable:
+        input_fmt = torch._prims_common.suggest_memory_format(input)
+        weight_fmt = torch._prims_common.suggest_memory_format(weight)
+        if input_fmt == torch.channels_last or weight_fmt == torch.channels_last:
             return torch.channels_last
-        if fmt == torch.channels_last_3d:
+        if input_fmt == torch.channels_last_3d or weight_fmt == torch.channels_last_3d:
             return torch.channels_last_3d
-    return torch.contiguous_format
+        return input_fmt
+
+    _input, _weight = input, weight
+    if weight.ndim == 3 and not input.is_mkldnn and not input.is_xpu:
+        _input = input.contiguous().unsqueeze(2)
+        _weight = weight.unsqueeze(2)
+
+    return torch._C._conv_determine_backend_memory_format(_input, _weight, conv_backend)
+
+
+def _empty_conv_result(
+    like: torch.Tensor,
+    shape: list[int],
+    mem_fmt: torch.memory_format | None,
+) -> torch.Tensor:
+    """Allocate an empty tensor for a conv result with the given memory format.
+
+    Handles the special case where channels_last must be applied to a 4d tensor
+    then squeezed back to 3d.  Uses dtype/device from ``like``.
+    """
+    if mem_fmt is None:
+        return torch.empty(shape, dtype=like.dtype, device=like.device)
+    if len(shape) == 3 and mem_fmt == torch.channels_last:
+        return torch.empty(
+            [shape[0], shape[1], 1, shape[2]],
+            dtype=like.dtype,
+            device=like.device,
+            memory_format=mem_fmt,
+        ).squeeze(2)
+    return torch.empty(
+        shape, dtype=like.dtype, device=like.device, memory_format=mem_fmt
+    )
 
 
 @register_meta(aten.convolution.default)
@@ -2628,20 +2701,20 @@ def meta_conv(
     if guard_or_false(input_tensor.size(input_channels_dim) == 0):
         shape_out[output_channels_dim] = 0
 
-    # Match backend output memory format: GPU backends (cuDNN, MPS) and CPU
-    # backends (MKLDNN, THNN) return channels_last output when either input or
-    # weight is channels_last.  Predicting the wrong format here causes Inductor
-    # to generate indexing code for the wrong layout, leading to silent accuracy
-    # regressions (see https://github.com/pytorch/pytorch/issues/138652).
-    memory_format = _conv_memory_format_for(input_tensor, weight)
-
-    out = torch.empty(
-        shape_out,
-        dtype=input_tensor.dtype,
-        device=input_tensor.device,
-        memory_format=memory_format,
+    # Determine output memory format using the actual backend selection logic.
+    # See https://github.com/pytorch/pytorch/issues/138652.
+    mem_fmt = _determine_conv_memory_format(
+        input_tensor,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        is_transposed,
+        output_padding,
+        groups,
     )
-    return out
+    return _empty_conv_result(input_tensor, shape_out, mem_fmt)
 
 
 if torch._C._has_mkldnn:
@@ -3698,31 +3771,32 @@ def meta_convolution_backward(
     backend_grad_weight = None
     backend_grad_bias = None
 
-    # Backend layout expectation: GPU backends (CUDA via cudnn_conv_suggest_memory_format,
-    # MPS via mps_conv_use_channels_last) return channels_last outputs when either input
-    # tensor is channels_last. This must be matched here to avoid stride assertion failures
-    # in inductor when the predicted strides don't match actual backend output strides.
+    # Determine output memory format using the actual backend selection logic.
     # See: https://github.com/pytorch/pytorch/issues/171622
-    #
-    # Memory format inference rules (matching backend behavior):
-    #   - grad_input format: derived from grad_output and weight
-    #   - grad_weight format: derived from input and grad_output
+    mem_fmt = _determine_conv_memory_format(
+        input_,
+        weight_,
+        bias=None,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        transposed=transposed,
+        output_padding=output_padding,
+        groups=groups,
+        bias_sizes=bias_sizes_opt,
+    )
 
     if output_mask[0]:
-        memory_format = _conv_memory_format_for(grad_output_, weight_)
-        backend_grad_input = torch.empty(
-            input_.size(),
-            dtype=grad_output_.dtype,
-            device=grad_output_.device,
-            memory_format=memory_format,
+        backend_grad_input = _empty_conv_result(
+            grad_output_,
+            list(input_.size()),
+            mem_fmt,
         )
     if output_mask[1]:
-        memory_format = _conv_memory_format_for(input_, grad_output_)
-        backend_grad_weight = torch.empty(
-            weight_.size(),
-            dtype=grad_output_.dtype,
-            device=grad_output_.device,
-            memory_format=memory_format,
+        backend_grad_weight = _empty_conv_result(
+            grad_output_,
+            list(weight_.size()),
+            mem_fmt,
         )
     if output_mask[2]:
         backend_grad_bias = grad_output_.new_empty(bias_sizes_opt)

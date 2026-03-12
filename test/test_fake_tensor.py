@@ -1859,11 +1859,11 @@ class FakeTensorOperatorInvariants(TestCase):
             )
             self.assertTrue(out.is_contiguous())
 
+    @skipIfTorchDynamo("test uses torch.compile and mark_unbacked internally")
     def test_convolution_unbacked_symint_strides(self):
-        """suggest_memory_format makes stride comparisons that produce
-        data-dependent guards on unbacked symbolic strides.  The meta
-        registrations should fall back to contiguous format instead of
-        raising.
+        """_select_conv_backend cannot handle unbacked symbolic shapes.
+        The meta registrations should fall back to contiguous format
+        instead of raising.
         """
 
         def forward_fn(x, w):
