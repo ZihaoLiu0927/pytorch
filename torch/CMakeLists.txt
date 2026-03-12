@@ -466,6 +466,28 @@ endif()
 
 install(TARGETS torch_python DESTINATION "${TORCH_INSTALL_LIB_DIR}")
 
+# Build the torch._C Python extension module.
+# Under setuptools, this is built by setuptools from torch/csrc/stub.c.
+# Under scikit-build-core (SKBUILD defined), CMake builds it directly.
+if(DEFINED SKBUILD AND BUILD_PYTHON AND NOT BUILD_LIBTORCH_WHL)
+  Python_add_library(_C MODULE "${TORCH_SRC_DIR}/csrc/stub.c")
+  target_link_libraries(_C PRIVATE torch_python)
+  set_target_properties(_C PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/torch"
+    # libtorch_python.so is installed to lib/ relative to _C, so use
+    # $ORIGIN/lib as the install RPATH (the global default is just $ORIGIN).
+    INSTALL_RPATH "${_rpath_portable_origin}/lib"
+  )
+  if(NOT WIN32)
+    set_target_properties(_C PROPERTIES
+      C_VISIBILITY_PRESET "default"
+    )
+  endif()
+  # Install at the install prefix root, which maps to torch/ in the wheel
+  # via wheel.install-dir = "torch"
+  install(TARGETS _C DESTINATION ".")
+endif()
+
 # Generate torch/version.py from the appropriate CMake cache variables.
 if(${CMAKE_BUILD_TYPE} STREQUAL "Debug")
   set(TORCH_VERSION_DEBUG 1)
