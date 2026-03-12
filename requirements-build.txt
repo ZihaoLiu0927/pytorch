@@ -1,4 +1,5 @@
 # Build System requirements
+scikit-build-core
 setuptools>=70.1.0,<82
 cmake>=3.27
 ninja
