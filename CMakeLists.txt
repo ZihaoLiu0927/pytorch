@@ -1498,5 +1498,7 @@ include(cmake/FileMirroring.cmake)
 # and setuptools builds.
 include(cmake/PackageData.cmake)
 
+include(cmake/PostBuildSteps.cmake)
+
 include(cmake/Summary.cmake)
 caffe2_print_configuration_summary()
