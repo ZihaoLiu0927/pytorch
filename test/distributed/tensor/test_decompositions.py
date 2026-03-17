@@ -193,12 +193,11 @@ class TestDecompSharding(TestCase):
         out = aten.index_add.default(input, 0, index, source)
         self.assertEqual(out.placements, (Shard(1),))
 
-        # polar: force replicate
-        check_no_strategy(aten.polar.default)
-        x = d_empty(16, device_mesh=mesh, placements=[Partial()])
-        y = d_empty(16, device_mesh=mesh, placements=[Partial()])
+        # polar: now has single_dim_strategy registered (pointwise)
+        x = d_empty(16, device_mesh=mesh, placements=[Shard(0)])
+        y = d_empty(16, device_mesh=mesh, placements=[Shard(0)])
         out = aten.polar.default(x, y)
-        self.assertEqual(out.placements, (Replicate(),))
+        self.assertEqual(out.placements, (Shard(0),))
 
     def test_roll_flip_strategies(self):
         """roll and flip unshard on active dims, keep sharding on others."""
