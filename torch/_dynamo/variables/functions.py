@@ -675,12 +675,17 @@ class UserFunctionVariable(BaseUserFunctionVariable):
         return result
 
     def var_getattr(self, tx: "InstructionTranslator", name: str) -> VariableTracker:
+        from .user_defined import generic_getattr
+
         if name == "__dict__":
             return super().var_getattr(tx, name)
-        elif name in cmp_name_to_op_mapping:
+        if name in cmp_name_to_op_mapping:
             return variables.GetAttrVariable(self, name)
         source = self.get_source()
-        return fn_var_getattr(tx, self.fn, source, name)
+        source = source and AttrSource(source, name)
+        if source and name == "__annotations__":
+            source = SkipGuardSource(source)
+        return generic_getattr(tx, self, self.fn, name, source)
 
     def call_obj_hasattr(
         self, tx: "InstructionTranslator", name: str
@@ -2296,10 +2301,15 @@ class SkipFunctionVariable(VariableTracker):
         return VariableTracker.build(tx, hasattr(self.value, name))
 
     def var_getattr(self, tx: "InstructionTranslator", name: str) -> VariableTracker:
+        from .user_defined import generic_getattr
+
         if name in cmp_name_to_op_mapping:
             return variables.GetAttrVariable(self, name)
 
-        return fn_var_getattr(tx, self.value, self.source, name)
+        source = self.source and AttrSource(self.source, name)
+        if source and name == "__annotations__":
+            source = SkipGuardSource(source)
+        return generic_getattr(tx, self, self.value, name, source)
 
     def is_python_hashable(self) -> bool:
         return True

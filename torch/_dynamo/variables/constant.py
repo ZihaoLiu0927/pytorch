@@ -13,7 +13,7 @@ from typing import Any, Literal, Optional, overload, TYPE_CHECKING
 from typing_extensions import Never, override
 
 import torch
-from torch._dynamo.source import AttrSource, GetItemSource
+from torch._dynamo.source import AttrSource, GetItemSource, Source
 
 from .. import graph_break_hints, variables
 from ..exc import raise_observed_exception, unimplemented
@@ -481,13 +481,17 @@ class EnumVariable(VariableTracker):
         return self.value
 
     def var_getattr(self, tx: "InstructionTranslator", name: str) -> VariableTracker:
-        if not hasattr(self.value, name):
-            raise NotImplementedError
+        from .user_defined import generic_getattr
+
         if name in cmp_name_to_op_mapping:
             return variables.GetAttrVariable(self, name)
-        member = getattr(self.value, name)
+        # Pre-check: if the attribute doesn't exist, let the caller handle
+        # the fallback (e.g. GetAttrVariable) rather than raising an observed
+        # exception which would trigger an awkward graph break path.
+        if not hasattr(self.value, name):
+            raise NotImplementedError
         source = self.source and AttrSource(self.source, name)
-        return VariableTracker.build(tx, member, source=source)
+        return generic_getattr(tx, self, self.value, name, source)
 
     def is_python_hashable(self) -> Literal[True]:
         raise_on_overridden_hash(self.value, self)

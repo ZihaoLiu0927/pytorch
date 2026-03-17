@@ -14498,6 +14498,36 @@ fn
         result2 = compiled_fn(x2)
         self.assertEqual(result2, x2)
 
+    def test_tensor_subclass_getattr_fallback(self):
+        # TensorVariable.dynamic_getattr bails on __getattr__, producing a
+        # GetAttrVariable instead of resolving the value at trace time.
+        # This means __getattr__-provided attributes can't be used as Python
+        # constants (e.g. in control flow or as shape arguments).
+        # Property-based attributes work; __getattr__ does not.
+        class MetaTensor(torch.Tensor):
+            @staticmethod
+            def __new__(cls, data, metadata=None):
+                t = torch.Tensor._make_subclass(cls, data)
+                t._metadata = metadata or {}
+                return t
+
+            def __getattr__(self, name):
+                if name == "_metadata":
+                    raise AttributeError(name)
+                if name in self._metadata:
+                    return self._metadata[name]
+                raise AttributeError(f"{type(self).__name__} has no attribute {name}")
+
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn(x):
+            if x.n_heads > 1:
+                return x * 2
+            return x
+
+        t = MetaTensor(torch.randn(8), metadata={"n_heads": 4})
+        result = fn(t)
+        self.assertEqual(result, t * 2)
+
 
 class MiscTestsPyTree(torch._inductor.test_case.TestCase):
     @parametrize_pytree_module

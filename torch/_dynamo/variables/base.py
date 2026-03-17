@@ -16,6 +16,7 @@ computations.
 import collections
 import functools
 import logging
+import types
 from collections.abc import Callable, ItemsView, KeysView, Sequence, ValuesView
 from contextvars import ContextVar
 from enum import Enum
@@ -441,6 +442,89 @@ class VariableTracker(metaclass=VariableTrackerMeta):
             # like __code__.co_argcount
             install_guard(source.make_guard(GuardBuilder.CONSTANT_MATCH))
         return variables.ConstantVariable.create(value, source=source)
+
+    # -- generic_getattr hook methods --
+    # Default implementations used by generic_getattr (user_defined.py) for VTs
+    # that don't override them (e.g. TensorVariable).  UDOV provides richer
+    # overrides that handle Python properties, staticmethod/classmethod, etc.
+
+    def maybe_trace_getattribute(
+        self,
+        tx: "InstructionTranslator",
+        name: str,
+        source: Source | None,
+        value: object,
+    ) -> "VariableTracker | None":
+        """Hook for tracing custom __getattribute__ overrides.
+
+        Returns a VariableTracker if __getattribute__ produced a result,
+        or None to fall through to the normal attribute lookup algorithm.
+        """
+        return None
+
+    def resolve_data_descriptor(
+        self,
+        tx: "InstructionTranslator",
+        name: str,
+        type_attr: object,
+        source: Source | None,
+        real_value: object,
+    ) -> "VariableTracker":
+        try:
+            resolved = type(real_value).__getattribute__(real_value, name)
+        except AttributeError:
+            error_message = VariableTracker.build(
+                tx,
+                f"'{type(real_value).__name__}' object has no attribute '{name}'",
+            )
+            raise_observed_exception(
+                AttributeError,
+                tx,
+                args=[error_message],
+            )
+        return VariableTracker.build(tx, resolved, source)
+
+    def resolve_type_attr(
+        self,
+        tx: "InstructionTranslator",
+        name: str,
+        type_attr: object,
+        source: Source | None,
+        real_value: object,
+    ) -> "VariableTracker":
+        try:
+            resolved = type(real_value).__getattribute__(real_value, name)
+        except AttributeError:
+            error_message = VariableTracker.build(
+                tx,
+                f"'{type(real_value).__name__}' object has no attribute '{name}'",
+            )
+            raise_observed_exception(
+                AttributeError,
+                tx,
+                args=[error_message],
+            )
+        return VariableTracker.build(tx, resolved, source)
+
+    def handle_getattr_fallback(
+        self,
+        tx: "InstructionTranslator",
+        name: str,
+        getattr_fn: "types.FunctionType",
+        real_value: object,
+    ) -> "VariableTracker":
+        resolved = getattr_fn(real_value, name)
+        attr_source = AttrSource(self.source, name) if self.source else None
+        return VariableTracker.build(tx, resolved, attr_source)
+
+    def maybe_wrap_nn_module_source_for_instance(
+        self,
+        tx: "InstructionTranslator",
+        name: str,
+        source: Source | None,
+        real_value: object,
+    ) -> Source | None:
+        return source
 
     def is_proxy(self) -> bool:
         try:

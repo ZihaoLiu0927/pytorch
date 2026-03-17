@@ -3129,6 +3129,22 @@
   "GB0256": [
     {
       "Gb_type": "User-defined object with non-function __getattr__",
+      "Context": "object={value}, name={name}, getattr_fn={getattr_fn}",
+      "Explanation": "Found a non-function __getattr__ {getattr_fn} from a user-defined object {value}  when attempting to getattr `{name}`",
+      "Hints": [
+        "Ensure the object's __getattr__ is a function type."
+      ]
+    },
+    {
+      "Gb_type": "User-defined object with non-function __getattr__",
+      "Context": "object={instance_vt.value}, name={name}, getattr_fn={getattr_fn}",
+      "Explanation": "Found a non-function __getattr__ {getattr_fn} from a user-defined object {instance_vt.value}  when attempting to getattr `{name}`",
+      "Hints": [
+        "Ensure the object's __getattr__ is a function type."
+      ]
+    },
+    {
+      "Gb_type": "User-defined object with non-function __getattr__",
       "Context": "object={self.value}, name={name}, getattr_fn={getattr_fn}",
       "Explanation": "Found a non-function __getattr__ {getattr_fn} from a user-defined object {self.value}  when attempting to getattr `{name}`",
       "Hints": [

@@ -68,6 +68,7 @@ from ..utils import (
     set_example_value,
     unpatched_nn_module_call,
     unpatched_nn_module_call_impl,
+    unpatched_nn_module_getattr,
 )
 from .base import raise_type_error_exc, typestr, ValueMutationNew, VariableTracker
 from .functions import invoke_and_store_as_constant
@@ -1318,6 +1319,36 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
                 result, type(hooks_dict), source=hooks_dict_source
             )
         return super().var_getattr(tx, name)
+
+    def handle_getattr_fallback(
+        self,
+        tx: "InstructionTranslator",
+        name: str,
+        getattr_fn: types.FunctionType,
+        real_value: object,
+    ) -> VariableTracker:
+        if (
+            getattr_fn is unpatched_nn_module_getattr
+            and istype(self.value._parameters, dict)  # type: ignore[attr-defined]
+            and istype(self.value._buffers, dict)  # type: ignore[attr-defined]
+            and istype(self.value._modules, dict)  # type: ignore[attr-defined]
+        ):
+            out = self.manually_trace_nn_module_getattr(tx, name)
+        else:
+            out = super().handle_getattr_fallback(tx, name, getattr_fn, real_value)
+
+        if self.source and getattr_fn is torch.nn.Module.__getattr__:
+            if isinstance(
+                out,
+                (
+                    variables.UnspecializedNNModuleVariable,
+                    variables.NNModuleVariable,
+                ),
+            ):
+                out.set_nn_module_stack_source(
+                    AttrSource(self.get_nn_module_stack_source(), name)
+                )
+        return out
 
     def manually_trace_nn_module_getattr(
         self, tx: "InstructionTranslator", name: str
