@@ -13,7 +13,6 @@ from torch.testing._internal.common_device_type import (
     onlyOn,
     skipCUDAIfNotRocm,
     skipMeta,
-    skipXPUIf,
 )
 from torch.testing._internal.common_dtype import (
     all_mps_types_and,
@@ -27,13 +26,6 @@ from torch.testing._internal.common_utils import (
     TestCase,
 )
 from torch.utils.dlpack import DLDeviceType, from_dlpack, to_dlpack
-
-
-device_type = (
-    acc.type
-    if (acc := torch.accelerator.current_accelerator(check_available=True))
-    else "cpu"
-)
 
 
 # Wraps a tensor, exposing only DLPack methods:
@@ -208,15 +200,15 @@ class TestTorchDlPack(TestCase):
     @onlyCUDA
     @dtypes(*all_types_and_complex_and(torch.half, torch.bfloat16, torch.bool))
     def test_dlpack_conversion_with_diff_streams(self, device, dtype):
-        stream_a = torch.Stream()
-        stream_b = torch.Stream()
+        stream_a = torch.cuda.Stream()
+        stream_b = torch.cuda.Stream()
         # DLPack protocol helps establish a correct stream order
         # (hence data dependency) at the exchange boundary.
         # the `tensor.__dlpack__` method will insert a synchronization event
         # in the current stream to make sure that it was correctly populated.
-        with stream_a:
+        with torch.cuda.stream(stream_a):
             x = make_tensor((5,), dtype=dtype, device=device) + 1
-            z = torch.from_dlpack(x.__dlpack__(stream=stream_b))
+            z = torch.from_dlpack(x.__dlpack__(stream=stream_b.cuda_stream))
             stream_a.synchronize()
         stream_b.synchronize()
         self.assertEqual(z, x)
@@ -282,9 +274,7 @@ class TestTorchDlPack(TestCase):
                 return capsule
 
         # CUDA-based tests runs on non-default streams
-        with torch.get_device_module(device_type).stream(
-            torch.get_device_module(device_type).default_stream()
-        ):
+        with torch.cuda.stream(torch.cuda.default_stream()):
             x = DLPackTensor(make_tensor((5,), dtype=torch.float32, device=device))
             from_dlpack(x)
 
@@ -294,22 +284,19 @@ class TestTorchDlPack(TestCase):
         # tests run on non-default stream, so _sleep call
         # below will run on a non-default stream, causing
         # default stream to wait due to inserted syncs
-        torch.get_device_module(device_type).default_stream().synchronize()
+        torch.cuda.default_stream().synchronize()
         # run _sleep call on a non-default stream, causing
         # default stream to wait due to inserted syncs
-        side_stream = torch.Stream()
-        with side_stream:
+        side_stream = torch.cuda.Stream()
+        with torch.cuda.stream(side_stream):
             x = torch.zeros(1, device=device)
-            if torch.cuda.is_available():
-                torch.cuda._sleep(2**20)
-            self.assertTrue(
-                torch.get_device_module(device_type).default_stream().query()
-            )
+            torch.cuda._sleep(2**20)
+            self.assertTrue(torch.cuda.default_stream().query())
             # ROCm uses stream 0 for default stream, CUDA uses stream 1
             default_stream_id = 0 if torch.version.hip else 1
             x.__dlpack__(stream=default_stream_id)
         # check that the default stream has work (a pending cudaStreamWaitEvent)
-        self.assertFalse(torch.get_device_module(device_type).default_stream().query())
+        self.assertFalse(torch.cuda.default_stream().query())
 
     @skipMeta
     @onlyNativeDeviceTypes
@@ -386,7 +373,7 @@ class TestTorchDlPack(TestCase):
         with self.assertRaisesRegex(
             BufferError, r"Can't export tensors on a different CUDA device"
         ):
-            with torch.get_device_module(device_type).device(dev1):
+            with torch.device(dev1):
                 x.__dlpack__()
 
     # TODO: add interchange tests once NumPy 1.22 (dlpack support) is required
@@ -544,8 +531,7 @@ class TestTorchDlPack(TestCase):
         self._test_from_dlpack(device, out_device=device, copy=False)
 
     @skipMeta
-    @onlyOn(["xpu", "cuda"])
-    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/2797")
+    @onlyCUDA
     def test_needs_copy_error(self, device):
         with self.assertRaisesRegex(ValueError, r"cannot move .* tensor from .*"):
             self._test_from_dlpack(device, out_device="cpu", copy=False)
@@ -826,8 +812,7 @@ class TestTorchDlPack(TestCase):
         )
 
     @skipMeta
-    @onlyOn(["xpu", "cuda"])
-    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/2798")
+    @onlyCUDA
     def test_numpy_cross_device_transfer(self, device):
         """Test cross-device transfer from NumPy (CPU) to PyTorch (CUDA).
 
@@ -845,12 +830,12 @@ class TestTorchDlPack(TestCase):
 
         # Test 1: copy=None (default) - should allow copy for cross-device
         t1 = from_dlpack(np_array, device=device)
-        self.assertEqual(t1.device.type, device_type)
+        self.assertEqual(t1.device.type, "cuda")
         self.assertEqual(t1, expected)
 
         # Test 2: copy=True - explicit copy
         t2 = from_dlpack(np_array, device=device, copy=True)
-        self.assertEqual(t2.device.type, device_type)
+        self.assertEqual(t2.device.type, "cuda")
         self.assertEqual(t2, expected)
 
         # Test 3: copy=False - should raise ValueError (can't do cross-device without copy)
@@ -860,10 +845,10 @@ class TestTorchDlPack(TestCase):
             from_dlpack(np_array, device=device, copy=False)
 
         # Test 4: device as string vs torch.device object (both should work)
-        t_str = from_dlpack(np_array, device=device_type)
-        t_obj = from_dlpack(np_array, device=torch.device(device_type))
-        self.assertEqual(t_str.device.type, device_type)
-        self.assertEqual(t_obj.device.type, device_type)
+        t_str = from_dlpack(np_array, device="cuda")
+        t_obj = from_dlpack(np_array, device=torch.device("cuda"))
+        self.assertEqual(t_str.device.type, "cuda")
+        self.assertEqual(t_obj.device.type, "cuda")
         self.assertEqual(t_str, t_obj)
 
         # Test 5: Regression - CPU -> CPU should still be zero-copy (share memory)
@@ -902,7 +887,7 @@ class TestTorchDlPack(TestCase):
         self.assertNotEqual(t0.device, t1.device)
 
 
-instantiate_device_type_tests(TestTorchDlPack, globals(), allow_mps=True)
+instantiate_device_type_tests(TestTorchDlPack, globals(), allow_mps=True, allow_xpu=True)
 
 if __name__ == "__main__":
     run_tests()
