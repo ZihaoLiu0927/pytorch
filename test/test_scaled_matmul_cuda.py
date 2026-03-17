@@ -22,6 +22,7 @@ from torch.nn.functional import (
 )
 from torch.testing._internal.common_cuda import (
     IS_SM90,
+    IS_SM100,
     _get_torch_cuda_version,
     PLATFORM_SUPPORTS_FP8,
     PLATFORM_SUPPORTS_FP8_GROUPED_GEMM,
@@ -74,6 +75,16 @@ f8_msg = "FP8 is only supported on H100+, SM 8.9 and MI300+ and XPU devices"
 f8_grouped_msg = "FP8 grouped is only supported on SM90 and MI300/MI350 devices"
 mx_skip_msg = "MX gemm is only supported on CUDA capability 10.0+"
 mxfp8_grouped_mm_skip_msg = "MXFP8 grouped GEMM is only supported when PyTorch is built with USE_MSLK=1 on SM100+"
+
+_CUTEDSL_AVAILABLE = False
+if TEST_CUDA:
+    from torch._native import cutedsl_utils as _cutedsl_utils
+    _CUTEDSL_AVAILABLE = _cutedsl_utils.runtime_available()
+
+cutedsl_mxfp8_skip_msg = (
+    "CuTeDSL MXFP8 grouped GEMM requires SM100 and CuTeDSL runtime "
+    "(nvidia-cutlass-dsl, apache-tvm-ffi, cuda-bindings)"
+)
 
 # avoid division by zero when calculating scale
 EPS = 1e-12
@@ -2420,6 +2431,246 @@ class TestFP8Matmul(TestCase):
             use_fast_accum=False,
         )
         torch.testing.assert_close(C, C_ref, atol=0, rtol=0)
+
+    @unittest.skipIf(not TEST_CUDA, "requires CUDA")
+    def test_cutedsl_mxfp8_gating_rejects_wrong_inputs(self, device="cuda"):
+        from unittest.mock import patch
+        from torch._native.ops.cutedsl_mxfp8_scaled_grouped_mm.scaled_grouped_mm_mxfp8 import (
+            _should_use_cutedsl_scaled_grouped_mm_mxfp8,
+        )
+        from torch._native import cutedsl_utils as cu
+
+        M, N, K, G = 128, 128, 128, 2
+        mat_a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        mat_b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        offs = torch.tensor([K // 2, K], device="cuda", dtype=torch.int32)
+        good_recipe = [ScalingType.BlockWise1x32.value]
+        good_swizzle = [SwizzleType.SWIZZLE_32_4_4.value]
+
+        with patch.object(cu, "runtime_available", return_value=True), \
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)):
+            # All conditions met → True
+            self.assertTrue(_should_use_cutedsl_scaled_grouped_mm_mxfp8(
+                mat_a, mat_b, good_recipe, good_swizzle,
+                good_recipe, good_swizzle, offs, None, False,
+            ))
+
+            # Wrong dtype (bf16)
+            bad_dtype = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+            self.assertFalse(_should_use_cutedsl_scaled_grouped_mm_mxfp8(
+                bad_dtype, mat_b, good_recipe, good_swizzle,
+                good_recipe, good_swizzle, offs, None, False,
+            ))
+
+            # Wrong scaling type (RowWise)
+            bad_recipe = [ScalingType.RowWise.value]
+            self.assertFalse(_should_use_cutedsl_scaled_grouped_mm_mxfp8(
+                mat_a, mat_b, bad_recipe, good_swizzle,
+                good_recipe, good_swizzle, offs, None, False,
+            ))
+
+            # Wrong swizzle (NO_SWIZZLE)
+            bad_swizzle = [SwizzleType.NO_SWIZZLE.value]
+            self.assertFalse(_should_use_cutedsl_scaled_grouped_mm_mxfp8(
+                mat_a, mat_b, good_recipe, bad_swizzle,
+                good_recipe, good_swizzle, offs, None, False,
+            ))
+
+            # 3D mat_a
+            mat_a_3d = mat_a.unsqueeze(0)
+            self.assertFalse(_should_use_cutedsl_scaled_grouped_mm_mxfp8(
+                mat_a_3d, mat_b, good_recipe, good_swizzle,
+                good_recipe, good_swizzle, offs, None, False,
+            ))
+
+            # offs=None
+            self.assertFalse(_should_use_cutedsl_scaled_grouped_mm_mxfp8(
+                mat_a, mat_b, good_recipe, good_swizzle,
+                good_recipe, good_swizzle, None, None, False,
+            ))
+
+            # bias provided
+            bias = torch.randn(N, device="cuda", dtype=torch.bfloat16)
+            self.assertFalse(_should_use_cutedsl_scaled_grouped_mm_mxfp8(
+                mat_a, mat_b, good_recipe, good_swizzle,
+                good_recipe, good_swizzle, offs, bias, False,
+            ))
+
+            # use_fast_accum=True
+            self.assertFalse(_should_use_cutedsl_scaled_grouped_mm_mxfp8(
+                mat_a, mat_b, good_recipe, good_swizzle,
+                good_recipe, good_swizzle, offs, None, True,
+            ))
+
+    @unittest.skipIf(
+        not (IS_SM100 and _CUTEDSL_AVAILABLE), cutedsl_mxfp8_skip_msg
+    )
+    @parametrize("G", [1, 4])
+    @parametrize("M", [2048])
+    @parametrize("N", [8192])
+    @parametrize("K", [16640])
+    def test_cutedsl_mxfp8_scaled_grouped_mm_2d_2d(self, G, M, N, K):
+        torch.manual_seed(42)
+
+        total_K = K
+        input_group_end_offsets = generate_jagged_offs(
+            G, total_K, multiple_of=32, device="cuda"
+        )
+        X = torch.randn((M, total_K), dtype=torch.bfloat16, device="cuda") * 0.1
+        W = torch.randn((N, total_K), dtype=torch.bfloat16, device="cuda") * 0.01
+
+        xh, xq, x_blocked_scales, _ = _2d_grouped_tensor_to_blocked_scaled(
+            X, M, G, input_group_end_offsets, format="mxfp8"
+        )
+        wh, wq, w_blocked_scales, _ = _2d_grouped_tensor_to_blocked_scaled(
+            W, N, G, input_group_end_offsets, format="mxfp8"
+        )
+
+        kwargs = _build_scaled_grouped_mm_kwargs(
+            x_blocked_scales, w_blocked_scales, input_group_end_offsets, "mxfp8",
+        )
+
+        y_lp = scaled_grouped_mm_wrap(xq, wq.transpose(-2, -1), **kwargs)
+
+        y_bf16 = grouped_mm(
+            xh, wh.t(), offs=input_group_end_offsets, out_dtype=torch.bfloat16
+        )
+
+        if y_lp.isnan().any():
+            raise AssertionError("low-precision output contains NaN")
+        torch.testing.assert_close(y_lp, y_bf16, atol=8.0e-2, rtol=8.0e-2)
+
+    @unittest.skipIf(
+        not (IS_SM100 and _CUTEDSL_AVAILABLE), cutedsl_mxfp8_skip_msg
+    )
+    @parametrize("G", [1, 4])
+    @parametrize("M", [16640])
+    @parametrize("N", [8192])
+    @parametrize("K", [4096])
+    def test_cutedsl_mxfp8_scaled_grouped_mm_2d_3d(self, G, M, N, K):
+        torch.manual_seed(42)
+
+        block_size = 32
+        total_M = M
+        X = torch.randn((total_M, K), dtype=torch.bfloat16, device="cuda") * 0.1
+        W = torch.randn((G, N, K), dtype=torch.bfloat16, device="cuda") * 0.01
+        input_group_end_offsets = generate_jagged_offs(
+            G, total_M, multiple_of=32, device="cuda"
+        )
+
+        def _3d_to_blocked_scaled(W, G):
+            wh_list, wq_list, w_scale_list = [], [], []
+            for i in range(G):
+                wh, wq, w_scale = _convert_to_mxfp8_with_hp_ref(W[i])
+                if torch.version.cuda:
+                    w_scale = to_blocked(w_scale)
+                wh_list.append(wh)
+                wq_list.append(wq)
+                w_scale_list.append(w_scale)
+            return (
+                torch.stack(wh_list, dim=0).contiguous(),
+                torch.stack(wq_list, dim=0).contiguous(),
+                torch.stack(w_scale_list, dim=0).contiguous(),
+            )
+
+        wh, wq, w_blocked_scales = _3d_to_blocked_scaled(W, G)
+
+        def _2d_to_blocked_scaled(X, K, G, offs):
+            xh_list, xq_list, x_scale_list = [], [], []
+            for i in range(G):
+                prev_group_end = 0 if i == 0 else offs[i - 1]
+                curr_group_end = offs[i]
+                group_size = curr_group_end - prev_group_end
+                if group_size > 0:
+                    x_slice = X[prev_group_end:curr_group_end, :]
+                    xh, xq, x_scale = _convert_to_mxfp8_with_hp_ref(x_slice)
+                    if torch.version.cuda:
+                        x_scale = to_blocked(x_scale)
+                    xh_list.append(xh)
+                    xq_list.append(xq)
+                    x_scale_list.append(x_scale)
+            xh = torch.cat(xh_list, dim=0).contiguous()
+            xq = torch.cat(xq_list, dim=0).contiguous()
+            x_scale = torch.cat(x_scale_list, dim=0).contiguous()
+            x_scale = x_scale.reshape(-1, K // block_size)
+            xq = xq.view(-1, xq.shape[-1])
+            xh = xh.view(-1, xh.shape[-1])
+            return xh, xq, x_scale
+
+        xh, xq, x_blocked_scales = _2d_to_blocked_scaled(
+            X, K, G, input_group_end_offsets
+        )
+
+        kwargs = _build_scaled_grouped_mm_kwargs(
+            x_blocked_scales, w_blocked_scales, input_group_end_offsets, "mxfp8",
+        )
+
+        y_lp = scaled_grouped_mm_wrap(xq, wq.transpose(-2, -1), **kwargs)
+
+        y_bf16 = grouped_mm(
+            xh, wh.transpose(-2, -1),
+            offs=input_group_end_offsets, out_dtype=torch.bfloat16,
+        )
+
+        if y_lp.isnan().any():
+            raise AssertionError("low-precision output contains NaN")
+        torch.testing.assert_close(y_lp, y_bf16, atol=8.0e-2, rtol=8.0e-2)
+
+    @unittest.skipIf(
+        not (IS_SM100 and _CUTEDSL_AVAILABLE and PLATFORM_SUPPORTS_MXFP8_GROUPED_GEMM),
+        "Requires SM100, CuTeDSL runtime, and MSLK (USE_MSLK=1)",
+    )
+    def test_cutedsl_backends_flag_disables_override(self):
+        from torch._native.ops.cutedsl_mxfp8_scaled_grouped_mm.scaled_grouped_mm_mxfp8 import (
+            _should_use_cutedsl_scaled_grouped_mm_mxfp8,
+        )
+
+        torch.manual_seed(42)
+        G, M, N, K = 2, 2048, 8192, 16640
+        total_K = K
+        input_group_end_offsets = generate_jagged_offs(
+            G, total_K, multiple_of=32, device="cuda"
+        )
+        X = torch.randn((M, total_K), dtype=torch.bfloat16, device="cuda") * 0.1
+        W = torch.randn((N, total_K), dtype=torch.bfloat16, device="cuda") * 0.01
+
+        xh, xq, x_blocked_scales, _ = _2d_grouped_tensor_to_blocked_scaled(
+            X, M, G, input_group_end_offsets, format="mxfp8"
+        )
+        wh, wq, w_blocked_scales, _ = _2d_grouped_tensor_to_blocked_scaled(
+            W, N, G, input_group_end_offsets, format="mxfp8"
+        )
+
+        kwargs = _build_scaled_grouped_mm_kwargs(
+            x_blocked_scales, w_blocked_scales, input_group_end_offsets, "mxfp8",
+        )
+
+        # Gating function should return True with flag enabled (default).
+        good_recipe = [ScalingType.BlockWise1x32.value]
+        good_swizzle = [SwizzleType.SWIZZLE_32_4_4.value]
+        self.assertTrue(_should_use_cutedsl_scaled_grouped_mm_mxfp8(
+            xq, wq.transpose(-2, -1), good_recipe, good_swizzle,
+            good_recipe, good_swizzle, input_group_end_offsets, None, False,
+        ))
+
+        # Gating function should return False with flag disabled.
+        with torch.backends.cutedsl.flags(enabled=False):
+            self.assertFalse(torch.backends.cutedsl.enabled)
+            self.assertFalse(_should_use_cutedsl_scaled_grouped_mm_mxfp8(
+                xq, wq.transpose(-2, -1), good_recipe, good_swizzle,
+                good_recipe, good_swizzle, input_group_end_offsets, None, False,
+            ))
+
+        # Flag is restored after context manager exits.
+        self.assertTrue(torch.backends.cutedsl.enabled)
+
+        # Full call through scaled_grouped_mm still works (falls through to MSLK).
+        with torch.backends.cutedsl.flags(enabled=False):
+            y_mslk = scaled_grouped_mm_wrap(xq, wq.transpose(-2, -1), **kwargs)
+        y_cutedsl = scaled_grouped_mm_wrap(xq, wq.transpose(-2, -1), **kwargs)
+        # Both should produce valid (non-NaN) results.
+        self.assertFalse(y_mslk.isnan().any())
+        self.assertFalse(y_cutedsl.isnan().any())
 
 
 instantiate_device_type_tests(TestFP8Matmul, globals(), except_for="cpu", allow_xpu=True)
