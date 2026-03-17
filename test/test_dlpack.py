@@ -111,8 +111,7 @@ class TestTorchDlPack(TestCase):
             # does not behave as expected on Jetson
             stream.synchronize()
         stream = torch.Stream()
-        acc = torch.accelerator.current_accelerator()
-        with torch.get_device_module(acc).stream(stream):
+        with stream:
             z = from_dlpack(x)
         stream.synchronize()
         return z
