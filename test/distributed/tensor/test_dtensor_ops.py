@@ -209,6 +209,7 @@ dtensor_fails = {
     xfail("resize_as_"),
     # DTensorConverter can't convert sparse tensor inputs
     xfail("sparse.sampled_addmm"),
+    xfail("squeeze_copy"),
     xfail("sparse.mm", "reduce"),
     # bug in squeeze.dims strategy: TypeError with empty dims arg
     xfail("squeeze", "multiple"),
@@ -420,10 +421,8 @@ dtensor_fails_no_strategy = {
     xfail("nn.functional.pad", "reflect"),
     xfail("nn.functional.pad", "replicate"),
     xfail("nn.functional.pad", "replicate_negative"),
-    xfail("nn.functional.pdist"),
     xfail("nn.functional.rrelu"),
     xfail("nn.functional.threshold"),
-    xfail("nn.functional.unfold"),
     xfail("nn.functional.upsample_nearest"),
     xfail("nonzero"),
     xfail("polar"),
@@ -456,8 +455,6 @@ dtensor_fails_no_strategy = {
     xfail("to_sparse"),
     xfail("unfold"),
     xfail("unfold_copy"),
-    xfail("unique"),
-    xfail("unique_consecutive"),
 }
 
 # Add a list of ops that are currently failing BW pass
