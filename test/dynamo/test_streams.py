@@ -1475,6 +1475,10 @@ class GraphModule(torch.nn.Module):
             torch.ops.streams.record_event.default,
             torch.fx.node._side_effectful_functions,
         )
+        self.assertIn(
+            torch.ops.streams.synchronize_event.default,
+            torch.fx.node._side_effectful_functions,
+        )
 
     @requires_cuda
     def test_backward_sync_control_deps_e2e(self) -> None:
@@ -1525,6 +1529,40 @@ class GraphModule(torch.nn.Module):
             len(control_deps_nodes),
             0,
             "Expected control_deps nodes in backward graph for stream synchronization",
+        )
+
+    @requires_cuda
+    def test_event_synchronize_tracing(self):
+        def fn(x):
+            e = torch.Event()
+            e.record()
+            x = x + 1
+            e.synchronize()
+            return x
+
+        inp = (torch.ones(2, 2, device="cuda"),)
+        (
+            _,
+            _,
+            fw_graphs,
+            _,
+        ) = extract_graph(fn, *inp)
+
+        self.assertExpectedInline(
+            print_graph(fw_graphs[0]),
+            """\
+class <lambda>(torch.nn.Module):
+    def forward(self, arg0_1: "f32[2, 2]"):
+        #
+        record_event = torch.ops.streams.record_event.default(0, 1);  record_event = None
+
+        #
+        add: "f32[2, 2]" = torch.ops.aten.add.Tensor(arg0_1, 1);  arg0_1 = None
+
+        #
+        synchronize_event = torch.ops.streams.synchronize_event.default(0);  synchronize_event = None
+        return (add,)
+""",
         )
 
 
