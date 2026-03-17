@@ -160,10 +160,17 @@ class MinCutOptions:
 
 
 def must_recompute(node: fx.Node) -> bool:
-    return node.meta.get("recompute", None) in [
+    if node.meta.get("recompute", None) not in [
         CheckpointPolicy.MUST_RECOMPUTE,
         CheckpointPolicy.PREFER_RECOMPUTE,
-    ]
+    ]:
+        return False
+    # Don't recompute nodes whose inputs are offloaded to CPU —
+    # the GPU tensor won't be available for recomputation.
+    for inp in node.all_input_nodes:
+        if must_offload(inp):
+            return False
+    return True
 
 
 def must_offload(node: fx.Node) -> bool:
@@ -176,6 +183,14 @@ def must_offload(node: fx.Node) -> bool:
 def has_recomputable_ops(fx_g: fx.GraphModule) -> bool:
     for node in fx_g.graph.nodes:
         if must_recompute(node):
+            return True
+        if node.meta.get("recompute", None) in [
+            CheckpointPolicy.MUST_RECOMPUTE,
+            CheckpointPolicy.PREFER_RECOMPUTE,
+        ]:
+            return True
+    for node in fx_g.graph.nodes:
+        if must_offload(node):
             return True
     return False
 
@@ -1194,6 +1209,57 @@ def _extract_fwd_bwd_modules(
     return fwd_module, bwd_module
 
 
+def _propagate_save_for_offloaded_deps(
+    joint_module: fx.GraphModule,
+    forward_node_names: OrderedSet[str],
+) -> None:
+    """Prevent recomputation of forward nodes that depend on offloaded tensors.
+
+    When a node is marked MUST_CPU_OFFLOAD, its GPU tensor is not saved for
+    backward. If a downstream forward node (e.g. rmsnorm consuming the offloaded
+    einsum output) is tagged PREFER_RECOMPUTE, recomputing it in backward would
+    require recomputing the offloaded tensor — defeating the purpose of offloading.
+
+    This pass does a BFS from each MUST_CPU_OFFLOAD node through forward users
+    and flips recompute-tagged descendants to MUST_SAVE so they're saved instead
+    of recomputed.
+    """
+    from collections import deque
+
+    offloaded = [
+        n for n in joint_module.graph.nodes
+        if must_offload(n) and n.name in forward_node_names
+    ]
+    if not offloaded:
+        return
+
+    visited: set[fx.Node] = set()
+    queue: deque[fx.Node] = deque(offloaded)
+    flipped = 0
+
+    while queue:
+        node = queue.popleft()
+        for user in node.users:
+            if user in visited or user.name not in forward_node_names:
+                continue
+            visited.add(user)
+            tag = user.meta.get("recompute", None)
+            if tag in (
+                CheckpointPolicy.PREFER_RECOMPUTE,
+                CheckpointPolicy.MUST_RECOMPUTE,
+            ):
+                user.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+                flipped += 1
+            # Continue BFS through this user's forward descendants
+            queue.append(user)
+
+    if flipped:
+        log.info(
+            "Offload propagation: flipped %d nodes from recompute to MUST_SAVE",
+            flipped,
+        )
+
+
 def default_partition(
     joint_module: fx.GraphModule,
     _joint_inputs: Any,
@@ -1259,6 +1325,12 @@ def default_partition(
             )
 
         joint_module = cleanup_recompute_tags(joint_module, is_default_partition=True)
+
+    # If any node is offloaded (MUST_CPU_OFFLOAD), prevent recomputation of
+    # downstream forward nodes whose recompute chain would require the
+    # offloaded tensor.  BFS from each offloaded node through forward users
+    # and flip PREFER_RECOMPUTE/MUST_RECOMPUTE to MUST_SAVE.
+    _propagate_save_for_offloaded_deps(joint_module, forward_node_names)
 
     if not config.unsafe_allow_optimization_of_collectives:
         force_save_collectives(joint_module)
@@ -1334,6 +1406,10 @@ def default_partition(
             continue
         if node.meta.get("recompute") == CheckpointPolicy.MUST_SAVE:
             saved_values.append(node)
+            continue
+        if must_offload(node):
+            # Don't save the original GPU tensor — the ao_offload CPU copy
+            # handles the forward→backward crossing instead.
             continue
         if is_impure(node):
             if graph_has_recomputable_ops:
