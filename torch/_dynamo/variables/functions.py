@@ -81,6 +81,7 @@ from ..utils import (
 )
 from .base import (
     AsPythonConstantNotImplementedError,
+    AttributeMutationExisting,
     AttributeMutationNew,
     raise_type_error_exc,
     ValueMutationNew,
@@ -548,7 +549,9 @@ class UserFunctionVariable(BaseUserFunctionVariable):
     @classmethod
     def create_with_source(cls, value: Any, source: Any) -> "UserFunctionVariable":
         install_guard(source.make_guard(GuardBuilder.CLOSURE_MATCH))
-        return cls(value, source=source)
+        return cls(
+            value, source=source, mutation_type=AttributeMutationExisting()
+        )
 
     def __init__(
         self,

@@ -1267,6 +1267,50 @@ def generic_getattr(
     )
 
 
+def generic_setattr(
+    tx: "InstructionTranslator",
+    instance_vt: Any,
+    value: object,
+    name: str,
+    val_vt: VariableTracker,
+) -> VariableTracker:
+    """CPython PyObject_GenericSetAttr — attribute write algorithm.
+
+    value is the real Python object backing instance_vt.
+
+    instance_vt must provide:
+        .resolve_setattr_descriptor(tx, name, type_attr, val_vt, value),
+    """
+    # Step 0: __class__ assignment
+    if name == "__class__":
+        unimplemented(
+            gb_type="__class__ assignment on user-defined object",
+            context=f"object={instance_vt}, value={val_vt}",
+            explanation="Dynamo does not support reassigning __class__ on user-defined objects.",
+            hints=[
+                "Move the __class__ assignment outside of the torch.compile region.",
+            ],
+        )
+
+    # Step 1: Type attr with __set__ — CPython's PyObject_GenericSetAttr only
+    # requires tp_descr_set (__set__), NOT __get__.  This differs from getattr
+    # where full data descriptors (__get__ + __set__) take MRO precedence.
+    type_attr = NO_SUCH_SUBOBJ
+    for base in type(value).__mro__:
+        if name in base.__dict__:
+            type_attr = base.__dict__[name]
+            break
+
+    if type_attr is not NO_SUCH_SUBOBJ and hasattr(type(type_attr), "__set__"):
+        return instance_vt.resolve_setattr_descriptor(
+            tx, name, type_attr, val_vt, value
+        )
+
+    # Step 2: Instance __dict__ write
+    tx.output.side_effects.store_attr(instance_vt, name, val_vt)
+    return variables.CONSTANT_VARIABLE_NONE
+
+
 class UserDefinedObjectVariable(UserDefinedVariable):
     """
     Mostly objects of defined type.  Catch-all for something where we only know the type.
@@ -1540,58 +1584,45 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                 ],
             )
 
-        if name_str == "__class__":
-            unimplemented(
-                gb_type="__class__ assignment on user-defined object",
-                context=f"object={self}, value={value}",
-                explanation="Dynamo does not support reassigning __class__ on user-defined objects.",
-                hints=[
-                    "Move the __class__ assignment outside of the torch.compile region.",
-                ],
-            )
-
         if directly_update_dict:
             self.get_dict_vt(tx).setitem(name_str, value)
-        else:
-            tmp = self.try_get_descritor_and_setter_py_func(name_str)
-            if tmp:
-                descriptor, setter = tmp
-                # Emulate
-                # https://github.com/python/cpython/blob/3.11/Objects/object.c#L1371-L1452
-                desc_source = None
-                func_source = None
-                if self.cls_source:
-                    desc_source = self.get_source_by_walking_mro(tx, name_str)
-                    # use `type(...)` to ignore instance attrs.
-                    func_source = AttrSource(TypeSource(desc_source), "__set__")
-                desc_var = VariableTracker.build(tx, descriptor, desc_source)
-                func_var = VariableTracker.build(tx, setter, func_source, realize=True)
-                if isinstance(descriptor, property):
-                    args = [self, value]  # property.fset(self, value)
-                else:
-                    args = [desc_var, self, value]  # __set__(desc, self, value)
-                return func_var.call_function(tx, args, {})
+            return variables.CONSTANT_VARIABLE_NONE
 
-            # Handle Python property descriptors whose __set__ is a C slot
-            # wrapper (not a Python function), which the above check misses.
-            # Mirrors the property getter handling in var_getattr.
-            descriptor = inspect.getattr_static(type(self.value), name_str, None)
-            if isinstance(descriptor, property) and descriptor.fset is not None:
-                fset_source = None
-                if self.cls_source:
-                    fset_source = AttrSource(
-                        self.get_source_by_walking_mro(tx, name_str), "fset"
-                    )
-                fset_var = VariableTracker.build(
-                    tx, descriptor.fset, source=fset_source
+        return generic_setattr(tx, self, self.value, name_str, value)
+
+    def resolve_setattr_descriptor(self, tx, name, type_attr, val_vt, value):
+        # Try Python-level descriptor with __set__
+        tmp = self.try_get_descritor_and_setter_py_func(name)
+        if tmp:
+            descriptor, setter = tmp
+            desc_source = func_source = None
+            if self.cls_source:
+                desc_source = self.get_source_by_walking_mro(tx, name)
+                # use `type(...)` to ignore instance attrs.
+                func_source = AttrSource(TypeSource(desc_source), "__set__")
+            desc_var = VariableTracker.build(tx, descriptor, desc_source)
+            func_var = VariableTracker.build(tx, setter, func_source, realize=True)
+            if isinstance(descriptor, property):
+                args = [self, val_vt]  # property.fset(self, value)
+            else:
+                args = [desc_var, self, val_vt]  # __set__(desc, self, value)
+            return func_var.call_function(tx, args, {})
+
+        # Handle property with C slot wrapper fset
+        descriptor = inspect.getattr_static(type(value), name, None)
+        if isinstance(descriptor, property) and descriptor.fset is not None:
+            fset_source = None
+            if self.cls_source:
+                fset_source = AttrSource(
+                    self.get_source_by_walking_mro(tx, name), "fset"
                 )
-                return fset_var.call_function(tx, [self, value], {})
+            fset_var = VariableTracker.build(
+                tx, descriptor.fset, source=fset_source
+            )
+            return fset_var.call_function(tx, [self, val_vt], {})
 
-            # NOTE: else we assume the descriptor (if any) has a
-            # side-effect-free `__set__` as far as Dynamo tracing is concerned.
-
-        # Emulate the standard setattr on instance dict.
-        tx.output.side_effects.store_attr(self, name_str, value)
+        # No traceable descriptor setter — fall through to instance dict write
+        tx.output.side_effects.store_attr(self, name, val_vt)
         return variables.CONSTANT_VARIABLE_NONE
 
     def needs_slow_setattr(self) -> bool:
@@ -3040,44 +3071,6 @@ class UserDefinedTupleVariable(UserDefinedObjectVariable):
 class MutableMappingVariable(UserDefinedObjectVariable):
     def __init__(self, value: object, **kwargs: Any) -> None:
         super().__init__(value, **kwargs)
-
-    def method_setattr_standard(
-        self,
-        tx: "InstructionTranslator",
-        name: VariableTracker,
-        value: VariableTracker,
-        directly_update_dict: bool = False,
-    ) -> VariableTracker:
-        """Override to handle property setters on MutableMapping subclasses.
-
-        This is needed because property.__set__ is a slot wrapper (C function),
-        not a Python function, so the base class's try_get_descritor_and_setter_py_func
-        returns None for properties. But property.fset IS a Python function we can trace.
-
-        Without this, property setters on newly created MutableMapping objects fail
-        when accessing nested objects (which haven't been initialized yet on the
-        example value). By tracing the fset, we capture the setter logic in the graph
-        instead of running it on uninitialized example objects.
-
-        TODO(compiler): This fix is scoped to MutableMapping only because tracing
-        property setters on ALL UserDefinedObjectVariable can cause failures when
-        the fset calls untraceable C++ functions (e.g., pybind functions). Ideally,
-        this should be extended to all user-defined classes with a graceful fallback
-        when tracing the fset hits an untraceable function.
-        See: https://github.com/pytorch/pytorch/issues/172000
-        """
-        if isinstance(name, variables.ConstantVariable) and isinstance(name.value, str):
-            name_str = name.value
-            descriptor = inspect.getattr_static(type(self.value), name_str, None)
-            if isinstance(descriptor, property) and descriptor.fset is not None:
-                fset_source = None
-                if self.cls_source:
-                    desc_source = self.get_source_by_walking_mro(tx, name_str)
-                    fset_source = AttrSource(desc_source, "fset")
-                fset_vt = VariableTracker.build(tx, descriptor.fset, fset_source)
-                return fset_vt.call_function(tx, [self, value], {})
-
-        return super().method_setattr_standard(tx, name, value, directly_update_dict)
 
     def var_getattr(self, tx: "InstructionTranslator", name: str) -> VariableTracker:
         # A common pattern in the init code of MutableMapping objects is to

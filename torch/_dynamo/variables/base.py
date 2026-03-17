@@ -506,6 +506,25 @@ class VariableTracker(metaclass=VariableTrackerMeta):
             )
         return VariableTracker.build(tx, resolved, source)
 
+    # -- generic_setattr hook methods --
+
+    def resolve_setattr_descriptor(
+        self,
+        tx: "InstructionTranslator",
+        name: str,
+        type_attr: object,
+        val_vt: "VariableTracker",
+        value: object,
+    ) -> "VariableTracker":
+        """Hook called when generic_setattr finds a type attr with __set__.
+
+        UDOV overrides this to trace into the descriptor's __set__ / property
+        fset.  The default ignores the descriptor and writes to the instance
+        dict — correct for VTs whose types don't have interesting descriptors.
+        """
+        tx.output.side_effects.store_attr(self, name, val_vt)
+        return variables.CONSTANT_VARIABLE_NONE
+
     def handle_getattr_fallback(
         self,
         tx: "InstructionTranslator",
