@@ -186,8 +186,7 @@ class TestDecompSharding(TestCase):
         out = aten.glu.default(x)
         self.assertEqual(out.placements, (Replicate(),))
 
-        # index_add: decomposes into index_put with accumulate=True
-        check_no_strategy(aten.index_add.default)
+        # index_add: has a registered single-dim strategy
         input = d_empty(4, 8, device_mesh=mesh, placements=[Shard(1)])
         index = distribute_tensor(torch.tensor([0, 2]), mesh, [Replicate()])
         source = d_empty(2, 8, device_mesh=mesh, placements=[Shard(1)])
