@@ -89,8 +89,22 @@ class AugmentedGraphHelper:
         return deps
 
     def has_cycle(self) -> bool:
-        merged_deps = {n: self.get_merged_deps(n) for n in self.graph.nodes}
-        return torch._dynamo.graph_deduplication._has_cycle(self.graph, merged_deps)
+        return torch._dynamo.graph_deduplication._has_cycle(
+            self.graph, self.get_all_extra_deps()
+        )
+
+    def _get_all_ancestors(self, node: fx.Node) -> OrderedSet[fx.Node]:
+        """Transitive ancestors through both data deps and extra deps."""
+        ancestors: OrderedSet[fx.Node] = OrderedSet()
+        stack: list[fx.Node] = list(node.all_input_nodes)
+        stack.extend(self.extra_deps.get(node, ()))
+        while stack:
+            n = stack.pop()
+            if n not in ancestors:
+                ancestors.add(n)
+                stack.extend(n.all_input_nodes)
+                stack.extend(self.extra_deps.get(n, ()))
+        return ancestors
 
     def has_path(self, source: fx.Node, target: fx.Node) -> bool:
         """Check if there's a path from source to target."""
@@ -178,6 +192,27 @@ class AugmentedGraphHelper:
             self.extra_deps[old_node].clear()
             self.extra_uses[old_node].clear()
             del self.merge_sets[old_node]
+
+    def remove_erased_extra_deps(self) -> None:
+        """Remove extra deps referencing erased nodes."""
+        for node in list(self.extra_deps):
+            if node._erased:
+                for dep in list(self.extra_deps[node]):
+                    self.remove_extra_dep(n=node, dep=dep)
+                continue
+            for dep in list(self.extra_deps[node]):
+                if dep._erased:
+                    self.remove_extra_dep(n=node, dep=dep)
+
+    def remove_cyclic_extra_deps(self) -> None:
+        """Remove extra deps that create cycles. Only runs if cycle detected."""
+        if not self.has_cycle():
+            return
+        for node in list(self.extra_deps):
+            for dep in list(self.extra_deps[node]):
+                ancestors = self._get_all_ancestors(dep)
+                if node in ancestors:
+                    self.remove_extra_dep(n=node, dep=dep)
 
     def get_all_extra_deps(self) -> dict[fx.Node, OrderedSet[fx.Node]]:
         """

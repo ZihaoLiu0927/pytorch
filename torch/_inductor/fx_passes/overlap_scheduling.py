@@ -378,7 +378,7 @@ class OverlapScheduler:
         bucket_exposed_first: bool | None = None,
         enable_fusion_regions: bool = False,
         bucket_only_internode_comms: bool = False,
-        bucket_mode: BucketMode = "custom_ops_multidtype",
+        bucket_mode: BucketMode = "default",
         max_off_bucket_gb: float | None = 0.5,
         prioritize_bucketing_during_scheduling: bool = True,
     ):
@@ -1433,12 +1433,12 @@ class OverlapScheduler:
         if not torch._inductor.config.test_configs.assume_bucketing_reduces_latency:
             return False
 
-        key = bucket_key(node, mode="custom_ops_multidtype")
+        key = bucket_key(node, mode=self.bucket_mode)
         if key is None:
             return False
 
         for in_flight_coll in self.in_flight:
-            if bucket_key(in_flight_coll, mode="custom_ops_multidtype") == key:
+            if bucket_key(in_flight_coll, mode=self.bucket_mode) == key:
                 return True
 
         return False

@@ -139,7 +139,7 @@ class OverlapPreservingBucketer:
         max_coll_distance: int = 1000,
         insert_overlap_deps: bool = False,
         collective_bucketing: bool = True,
-        bucket_mode: BucketMode = "custom_ops_multidtype",
+        bucket_mode: BucketMode = "default",
         bucket_exposed_first: bool | None = None,
         region_of: dict[fx.Node, Any] | None = None,
         bucket_only_internode_comms: bool = False,
@@ -336,6 +336,9 @@ class OverlapPreservingBucketer:
         """Apply topological sort and effect tokens to preserve overlap."""
         from torch._dynamo.graph_deduplication import _stable_topological_sort
 
+        # Clean up any remaining erased node references and cycles
+        self.aug_graph.remove_erased_extra_deps()
+        self.aug_graph.remove_cyclic_extra_deps()
         additional_deps = self.aug_graph.get_all_extra_deps()
 
         for n, deps in additional_deps.items():
@@ -998,13 +1001,13 @@ class OverlapPreservingBucketer:
                 self.graph,
                 bucket,
                 insert_before=next_node,
-                mode="custom_ops",
+                mode=self.bucket_mode,
             )
         elif is_all_reduce_tensor(bucket[0]):
             new_nodes, replacements = merge_all_reduce_bucket(
                 self.graph,
                 bucket,
-                mode="custom_ops",
+                mode=self.bucket_mode,
                 insert_before=next_node,
             )
         else:
@@ -1013,7 +1016,7 @@ class OverlapPreservingBucketer:
                 self.graph,
                 bucket,
                 insert_before=next_node,
-                mode="custom_ops",
+                mode=self.bucket_mode,
             )
 
         # Get new nodes
