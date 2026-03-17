@@ -26,6 +26,8 @@ from torch.testing._internal.common_quantized import (
     _calculate_dynamic_per_channel_qparams,
 )
 from torch.testing._internal.common_utils import (
+    IS_ARM64,
+    IS_CPU_EXT_SVE_SUPPORTED,
     IS_MACOS,
     IS_WINDOWS,
     parametrize,
@@ -3311,6 +3313,20 @@ instantiate_device_type_tests(TestSelectAlgorithm, globals(), only_for="cpu")
 instantiate_device_type_tests(
     TestSelectAlgorithmDynamicShapes, globals(), only_for="cpu"
 )
+
+# see https://github.com/pytorch/pytorch/issues/177327
+# test_int8_woq_mm is flaky on AArch64 (no SVE). Skip entirely on AArch64 (no SVE).
+_woq_mm_skip = unittest.skipIf(
+    IS_ARM64 and not IS_CPU_EXT_SVE_SUPPORTED,
+    "flaky on AArch64 (no SVE)",
+)
+for _attr in list(vars(TestSelectAlgorithmCPU)):  # noqa: F821
+    if _attr.startswith("test_int8_woq_mm_"):
+        setattr(
+            TestSelectAlgorithmCPU,  # noqa: F821
+            _attr,
+            _woq_mm_skip(getattr(TestSelectAlgorithmCPU, _attr)),  # noqa: F821
+        )
 
 
 if __name__ == "__main__":

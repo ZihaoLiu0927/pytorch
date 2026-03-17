@@ -6219,6 +6219,16 @@ class CPUReproTests(TestCase):
         )
 
 
+# see https://github.com/pytorch/pytorch/issues/146483
+# test_lstm_packed is flaky on AArch64 (no SVE). Skip entirely on AArch64 (no SVE).
+_lstm_packed_skip = unittest.skipIf(
+    IS_ARM64 and not IS_CPU_EXT_SVE_SUPPORTED,
+    "flaky on AArch64 (no SVE)",
+)
+for _attr in list(vars(CPUReproTests)):
+    if _attr.startswith("test_lstm_packed_"):
+        setattr(CPUReproTests, _attr, _lstm_packed_skip(getattr(CPUReproTests, _attr)))
+
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
     from torch.testing._internal.inductor_utils import HAS_CPU
