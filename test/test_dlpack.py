@@ -512,7 +512,7 @@ class TestTorchDlPack(TestCase):
             self.assertNotEqual(inp.data_ptr(), out.data_ptr())
 
     @skipMeta
-    @onlyOn(["xpu", "cuda"])
+    @onlyCUDA
     def test_copy(self, device):
         # Force-copy same device tensor.
         self._test_from_dlpack(device, copy=True)
@@ -887,7 +887,9 @@ class TestTorchDlPack(TestCase):
         self.assertNotEqual(t0.device, t1.device)
 
 
-instantiate_device_type_tests(TestTorchDlPack, globals(), allow_mps=True, allow_xpu=True)
+instantiate_device_type_tests(
+    TestTorchDlPack, globals(), allow_mps=True, allow_xpu=True
+)
 
 if __name__ == "__main__":
     run_tests()
