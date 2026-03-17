@@ -2758,6 +2758,8 @@ class FunctoolsPartialVariable(VariableTracker):
     def call_obj_hasattr(
         self, tx: "InstructionTranslator", name: str
     ) -> ConstantVariable:
+        if tx.output.side_effects.has_pending_mutation_of_attr(self, name):
+            return variables.ConstantVariable.create(True)
         # functools.partial uses slots, so attributes are constant
         return VariableTracker.build(tx, hasattr(functools.partial(identity), name))
 

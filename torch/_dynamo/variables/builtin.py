@@ -2775,8 +2775,10 @@ class BuiltinVariable(VariableTracker):
                 variables.NamedTupleVariable,
                 variables.UserDefinedObjectVariable,
                 variables.NestedUserFunctionVariable,
+                variables.UserFunctionVariable,
                 variables.ExceptionVariable,
                 variables.TracebackVariable,
+                variables.UserDefinedClassVariable,
             ),
         ):
             return obj.call_method(tx, "__setattr__", [name_var, val], {})

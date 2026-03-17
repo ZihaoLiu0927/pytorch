@@ -516,13 +516,17 @@ class UserDefinedClassVariable(UserDefinedVariable):
                 args[0],
                 args[1:],
             )
-        elif name == "__setattr__" and self.ban_mutation:
-            unimplemented(
-                gb_type="Class attribute mutation when the __dict__ was already materialized",
-                context=str(self.value),
-                explanation="Dyanmo does not support tracing mutations on a class when its __dict__ is materialized",
-                hints=graph_break_hints.SUPPORTABLE,
-            )
+        elif name == "__setattr__":
+            if self.ban_mutation:
+                unimplemented(
+                    gb_type="Class attribute mutation when the __dict__ was already materialized",
+                    context=str(self.value),
+                    explanation="Dyanmo does not support tracing mutations on a class when its __dict__ is materialized",
+                    hints=graph_break_hints.SUPPORTABLE,
+                )
+            attr_name = args[0].as_python_constant()
+            tx.output.side_effects.store_attr(self, attr_name, args[1])
+            return variables.ConstantVariable.create(None)
         return super().call_method(tx, name, args, kwargs)
 
     def call_function(

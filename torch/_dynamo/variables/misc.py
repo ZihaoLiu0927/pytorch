@@ -588,6 +588,8 @@ class ExceptionVariable(VariableTracker):
         # The user stack at the time this exception was first raised.
         # Used to preserve the original exception location when re-raising.
         self.python_stack: traceback.StackSummary | None = None
+        # Arbitrary user-set attributes (e.g. exc.custom_field = val)
+        self._custom_attrs: dict[str, VariableTracker] = {}
 
     def set_context(self, context: VariableTracker) -> None:
         self.__context__ = context
@@ -612,6 +614,12 @@ class ExceptionVariable(VariableTracker):
         codegen_attr("__context__")
         codegen_attr("__cause__")
         codegen_attr("__suppress_context__")
+
+        for attr_name, attr_val in self._custom_attrs.items():
+            codegen.dup_top()
+            codegen(attr_val)
+            codegen.extend_output(codegen.rot_n(2))
+            codegen.store_attr(attr_name)
 
     def python_type(self) -> type:
         return self.exc_type
@@ -664,14 +672,7 @@ class ExceptionVariable(VariableTracker):
                 )
             self.__traceback__ = val
         else:
-            unimplemented(
-                gb_type="Unsupported attribute assignment on Exception object",
-                context=f"call_setattr {self} {name}",
-                explanation="Dynamo does not support setting the attribute "
-                f"'{name}' on tracked exception objects. Only `__context__`, "
-                "`__cause__`, `__suppress_context__`, and `__traceback__` are supported.",
-                hints=[*graph_break_hints.SUPPORTABLE],
-            )
+            self._custom_attrs[name] = val
         return variables.CONSTANT_VARIABLE_NONE
 
     def call_method(
@@ -701,6 +702,8 @@ class ExceptionVariable(VariableTracker):
             return self.__traceback__
         elif name == "args":
             return variables.ListVariable(list(self.args), source=self.source)
+        elif name in self._custom_attrs:
+            return self._custom_attrs[name]
         return super().var_getattr(tx, name)
 
     def __str__(self) -> str:

@@ -14828,6 +14828,62 @@ def forward(self, L_x_ : torch.Tensor):
         self.assertEqual(ref, result)
         self.assertEqual(saved_ref, saved["grad"])
 
+    def test_userfunction_setattr(self):
+        def target_fn():
+            pass
+
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn(x):
+            target_fn.custom_attr = "hello"
+            return x + 1
+
+        x = torch.randn(4)
+        fn(x)
+        self.assertEqual(target_fn.custom_attr, "hello")
+
+    def test_exception_arbitrary_setattr(self):
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn(x):
+            e = ValueError("test")
+            e.custom_field = 42
+            if e.custom_field != 42:
+                return x - 1
+            return x + 1
+
+        x = torch.randn(4)
+        result = fn(x)
+        self.assertEqual(result, x + 1)
+
+    def test_class_setattr(self):
+        class MyClass:
+            pass
+
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn(x):
+            MyClass.new_attr = "world"
+            return x + 1
+
+        x = torch.randn(4)
+        fn(x)
+        self.assertEqual(MyClass.new_attr, "world")
+
+    def test_functools_partial_setattr(self):
+        import functools
+
+        def base_fn(a, b):
+            return a + b
+
+        p = functools.partial(base_fn, 1)
+
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn(x):
+            p.custom = "test"
+            return x + 1
+
+        x = torch.randn(4)
+        fn(x)
+        self.assertEqual(p.custom, "test")
+
 
 class MiscTestsPyTree(torch._inductor.test_case.TestCase):
     @parametrize_pytree_module

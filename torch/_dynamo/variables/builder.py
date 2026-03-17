@@ -1025,9 +1025,14 @@ class VariableBuilder:
             )
             # Preserve cache_hash for SAC context_fn caching
             original_cache_hash = getattr(value, "cache_hash", None)
-            return FunctoolsPartialVariable(
-                func_obj, args, keywords, original_cache_hash=original_cache_hash
+            result = FunctoolsPartialVariable(
+                func_obj,
+                args,
+                keywords,
+                original_cache_hash=original_cache_hash,
+                source=self.source,
             )
+            return self.tx.output.side_effects.track_object_existing(value, result)
         elif is_typing(value):
             # typing.List, typing.Mapping, etc.
             self.install_guards(GuardBuilder.ID_MATCH)
@@ -1439,9 +1444,12 @@ class VariableBuilder:
             if attr_name is not None:
                 self.source = AttrSource(self.source, attr_name)
             # type: ignore[attr-defined]
-            return trace_rules.lookup(value).create_with_source(
+            result = trace_rules.lookup(value).create_with_source(
                 value, source=self.source
             )
+            if isinstance(result, UserFunctionVariable):
+                return self.tx.output.side_effects.track_object_existing(value, result)
+            return result
         elif value is random.Random:
             self.install_guards(GuardBuilder.ID_MATCH)
             return RandomClassVariable(source=self.source)
@@ -1532,10 +1540,11 @@ class VariableBuilder:
                     source=self.source,
                 )
 
-            return UserDefinedClassVariable(
+            result = UserDefinedClassVariable(
                 value,
                 source=self.source,
             )
+            return self.tx.output.side_effects.track_object_existing(value, result)
         elif TorchScriptObjectVariable.is_matching_cls(type(value)):
             from ..source import (
                 FlattenScriptObjectSource,
