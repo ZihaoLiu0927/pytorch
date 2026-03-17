@@ -779,3 +779,26 @@ def if_mask(mask: Any, val, *, _builder: object = None) -> tl.constexpr:
     if isinstance(mask, tl.constexpr) and mask.value is None:
         return tl.constexpr(None)
     return val
+
+
+@triton.jit
+def inline_asm_pack(x, pack: tl.constexpr):
+    """Ravel to 1D and pad (via join with zeros) so numel is divisible by pack."""
+    # Always pad — Triton requires consistent return shapes across branches,
+    # so we can't conditionally skip padding. The extra work is only on the
+    # asm instruction itself, not the full kernel.
+    result = x.ravel()
+    for _ in tl.static_range(_log2(pack)):
+        result = tl.reshape(
+            tl.join(result, tl.zeros_like(result)), (result.shape[0] * 2,)
+        )
+    return result
+
+
+@triton.jit
+def inline_asm_unpack(x, orig, pack: tl.constexpr):
+    """Unpad and reshape back to orig's shape."""
+    result = x
+    for _ in tl.static_range(_log2(pack)):
+        result, _ = tl.split(tl.reshape(result, (result.shape[0] // 2, 2)))
+    return tl.reshape(result, orig.shape)
