@@ -166,6 +166,13 @@ def must_recompute(node: fx.Node) -> bool:
     ]
 
 
+def must_offload(node: fx.Node) -> bool:
+    return node.meta.get("recompute", None) in [
+        CheckpointPolicy.MUST_CPU_OFFLOAD,
+        CheckpointPolicy.PREFER_CPU_OFFLOAD,
+    ]
+
+
 def has_recomputable_ops(fx_g: fx.GraphModule) -> bool:
     for node in fx_g.graph.nodes:
         if must_recompute(node):
@@ -2226,7 +2233,7 @@ def solve_min_cut(
                 return False
         # This bans recomputation of the node unless we've been forced not to by
         # user annotation
-        if must_recompute(node):
+        if must_recompute(node) or must_offload(node):
             return False
 
         if "val" in node.meta and isinstance(node.meta["val"], torch.SymFloat):
@@ -2265,6 +2272,14 @@ def solve_min_cut(
                     reason="must be computed in backward: required for gradient",
                 )
                 continue
+
+        if must_offload(node):
+            # Offloaded nodes: don't save the GPU tensor and don't recompute.
+            # The value is available in backward via a CPU offload/reload path.
+            # We set weight=0 so the min-cut effectively ignores this node;
+            # the ao_offload output (CPU tensor) will be saved instead.
+            nx_graph.add_edge(node.name + "_in", node.name + "_out", capacity=0)
+            continue
 
         if must_recompute(node):
             # If user explicitly says they want to recompute a node, we honor it
