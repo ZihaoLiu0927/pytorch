@@ -20,15 +20,15 @@ class FlashAttentionHandle(Protocol):
 _RegisterFn = Callable[..., FlashAttentionHandle | None]
 _FlashAttentionImpl = Literal["FA3", "FA4"]
 
-_FLASH_ATTENTION_IMPLS: dict[str, _RegisterFn] = {}
+_FLASH_ATTENTION_IMPLS: dict[str, _RegisterFn | None] = {}
 
-_FLASH_ATTENTION_ACTIVE: tuple[str, FlashAttentionHandle] | None = None
+_FLASH_ATTENTION_ACTIVE: tuple[str, FlashAttentionHandle | None] | None = None
 
 
 def register_flash_attention_impl(
     impl: str | _FlashAttentionImpl,
     *,
-    register_fn: _RegisterFn,
+    register_fn: _RegisterFn | None,
 ) -> None:
     """
     Register the callable that activates a flash attention impl.
@@ -88,6 +88,15 @@ def activate_flash_attention_impl(
     )  # first restore any prev overrides (if any) to default
 
     register_fn = _FLASH_ATTENTION_IMPLS.get(impl)
+
+    # HACK: We don't register / de-register implementations
+    #       with _native/ops, we just selectively call in the override
+    #       => No actual register_fn to call...
+    if impl == "FA4":
+        _FLASH_ATTENTION_ACTIVE = (impl, None)
+        return
+
+
     if register_fn is None:
         raise ValueError(
             f"Unknown flash attention impl '{impl}'. "

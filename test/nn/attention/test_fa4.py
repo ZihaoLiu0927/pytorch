@@ -114,7 +114,7 @@ class TestFlashAttentionFA4(FlashAttentionTestMixin, TestCase):
     @parametrize("deterministic", [False, True])
     def test_deterministic_flag_passed_to_backward(self, device, deterministic):
         """Test that deterministic flag is correctly passed through to FA4 backward kernel."""
-        from torch.nn.attention import _fa4
+        from torch._native.ops.fa4 import _fa4_impl as _fa4
 
         shape = SdpaShape(2, 4, 512, 128)
         q = torch.randn(shape, dtype=torch.float16, device=device, requires_grad=True)
@@ -126,7 +126,7 @@ class TestFlashAttentionFA4(FlashAttentionTestMixin, TestCase):
         try:
             _fa4._fa4_import_module.cache_clear()
 
-            with patch("torch.nn.attention._fa4._fa4_import_module") as mock_import:
+            with patch("torch._native.ops.fa4._fa4_impl._fa4_import_module") as mock_import:
                 mock_module = mock_import.return_value
 
                 # FA4 uses BSHD layout internally, so mock returns BSHD

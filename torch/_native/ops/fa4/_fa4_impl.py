@@ -1,38 +1,24 @@
-"""UBER PROTOTYPE!!!"""
-# mypy: allow-untyped-defs
+import torch
 
-from __future__ import annotations
-
-import importlib
 from dataclasses import dataclass
 from functools import cache
+import importlib
+
+_FA4_MODULE_PATH: str | None = None
+
 from typing import Any, TYPE_CHECKING
 from typing_extensions import TypeVarTuple, Unpack
-
-from . import _registry
-
 
 if TYPE_CHECKING:
     from types import ModuleType
 
-import torch
-from torch.library import Library
 
-
-__all__ = [
-    "register_flash_attention_fa4",
-]
-
-
-_FA4_MODULE_PATH: str | None = None
-
-
-@dataclass
-class _FA4Handle:
-    library: Library | None
-
-    def remove(self) -> None:
-        self.library = None
+# @dataclass
+# class _FA4Handle:
+#     library: Library | None
+#
+#     def remove(self) -> None:
+#         self.library = None
 
 
 @cache
@@ -40,45 +26,27 @@ def _get_device_major(device: torch.device) -> int:
     major, _ = torch.cuda.get_device_capability(device)
     return major
 
-
-def register_flash_attention_fa4(
-    module_path: str = "flash_attn.cute.interface",
-) -> _FA4Handle:
-    """
-    Register FA4 flash attention kernels with the PyTorch dispatcher.
-
-    Args:
-        module_path: Python module path to the FA4 implementation.
-    """
-    global _FA4_MODULE_PATH
-    _ = _fa4_import_module(module_path)
-    _FA4_MODULE_PATH = module_path
-    return _FA4Handle(_fa4_register_kernels())
-
-
 @cache
-def _fa4_import_module(module_path: str) -> ModuleType:
+def _fa4_import_module(module_path: str = "flash_attn.cute.interface"): #  -> ModuleType:
     module = importlib.import_module(module_path)
     if not hasattr(module, "_flash_attn_fwd") or not hasattr(module, "_flash_attn_bwd"):
         raise RuntimeError(f"Module '{module_path}' does not expose FA4 kernels")
     return module
 
 
-def _fa4_register_kernels() -> Library:
-    lib = Library("aten", "IMPL", "CUDA")  # noqa: TOR901
-    lib.impl("_flash_attention_forward", _fa4_flash_attention_forward_impl, "CUDA")
-    lib.impl("_flash_attention_backward", _fa4_flash_attention_backward_impl, "CUDA")
-    lib.impl(
-        "_scaled_dot_product_flash_attention",
-        _fa4_scaled_dot_product_flash_attention_forward_impl,
-        "CUDA",
-    )
-    lib.impl(
-        "_scaled_dot_product_flash_attention_backward",
-        _fa4_scaled_dot_product_flash_attention_backward_impl,
-        "CUDA",
-    )
-    return lib
+# def register_flash_attention_fa4(
+#     module_path: str = "flash_attn.cute.interface",
+# ) -> _FA4Handle:
+#     """
+#     Register FA4 flash attention kernels with the PyTorch dispatcher.
+#
+#     Args:
+#         module_path: Python module path to the FA4 implementation.
+#     """
+#     global _FA4_MODULE_PATH
+#     _ = _fa4_import_module(module_path)
+#     _FA4_MODULE_PATH = module_path
+#     # return _FA4Handle(_fa4_register_kernels())
 
 
 def _fa4_common_support_error(
@@ -187,9 +155,9 @@ def _fa4_run_forward(
     seqused_k: torch.Tensor | None,
     out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if _FA4_MODULE_PATH is None:
-        raise RuntimeError("FA4 not registered")
-    module = _fa4_import_module(_FA4_MODULE_PATH)
+    # if _FA4_MODULE_PATH is None:
+    #     raise RuntimeError("FA4 not registered")
+    module = _fa4_import_module()
 
     kwargs: dict[str, Any] = {
         "softmax_scale": scale,
@@ -220,9 +188,9 @@ def _fa4_run_backward(
     is_causal: bool,
     deterministic: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if _FA4_MODULE_PATH is None:
-        raise RuntimeError("FA4 not registered")
-    module = _fa4_import_module(_FA4_MODULE_PATH)
+    # if _FA4_MODULE_PATH is None:
+    #     raise RuntimeError("FA4 not registered")
+    module = _fa4_import_module()
     dq, dk, dv = module._flash_attn_bwd(
         query,
         key,
@@ -455,6 +423,3 @@ def _fa4_scaled_dot_product_flash_attention_backward_impl(
     )
     dq, dk, dv = _transpose_dense(dq, dk, dv)
     return dq, dk, dv
-
-
-_registry.register_flash_attention_impl("FA4", register_fn=register_flash_attention_fa4)
