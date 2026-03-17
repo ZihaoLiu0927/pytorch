@@ -1,5 +1,6 @@
 # Owner(s): ["module: dsl-native-ops"]
 
+import importlib.util
 import os
 import subprocess
 import sys
@@ -20,12 +21,31 @@ def _subprocess_lastline(script, env=None):
     return result.rsplit("\n", 1)[-1]
 
 
+def _import_module_directly(module_name, file_name):
+    """Import a module directly without triggering package imports."""
+    test_dir = os.path.dirname(os.path.abspath(__file__))
+    pytorch_root = os.path.dirname(os.path.dirname(test_dir))
+    module_path = os.path.join(pytorch_root, "torch", "_native", file_name)
+
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 class TestNativeDSLOps(TestCase):
     """Tests for the torch._native DSL ops framework."""
 
     def test_consistent_helper_interface(self):
         """triton_utils and cutedsl_utils expose the same public API."""
-        from torch._native import cutedsl_utils, triton_utils
+        # Import modules directly to avoid dependency issues
+        triton_utils = _import_module_directly(
+            "torch._native.triton_utils", "triton_utils.py"
+        )
+        cutedsl_utils = _import_module_directly(
+            "torch._native.cutedsl_utils", "cutedsl_utils.py"
+        )
 
         REQUIRED_METHODS = {
             "runtime_available",
@@ -76,9 +96,22 @@ class TestNativeDSLOps(TestCase):
         """TORCH_DISABLE_NATIVE_JIT unset -> check returns False."""
         script = textwrap.dedent("""\
             import os
+            import importlib.util
+            import sys
+
             os.environ.pop("TORCH_DISABLE_NATIVE_JIT", None)
-            from torch._native.common_utils import check_native_jit_disabled
-            print(check_native_jit_disabled())
+
+            # Import common_utils directly
+            import os
+            test_dir = os.getcwd()
+            pytorch_root = os.path.dirname(os.path.dirname(test_dir))
+            common_utils_path = os.path.join(pytorch_root, "torch", "_native", "common_utils.py")
+
+            spec = importlib.util.spec_from_file_location("common_utils", common_utils_path)
+            common_utils = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(common_utils)
+
+            print(common_utils.check_native_jit_disabled())
         """)
         result = _subprocess_lastline(script)
         self.assertEqual(result, "False")
@@ -86,8 +119,20 @@ class TestNativeDSLOps(TestCase):
     def test_check_native_jit_disabled_set(self):
         """TORCH_DISABLE_NATIVE_JIT=1 -> check returns True."""
         script = textwrap.dedent("""\
-            from torch._native.common_utils import check_native_jit_disabled
-            print(check_native_jit_disabled())
+            import importlib.util
+            import sys
+
+            # Import common_utils directly
+            import os
+            test_dir = os.getcwd()
+            pytorch_root = os.path.dirname(os.path.dirname(test_dir))
+            common_utils_path = os.path.join(pytorch_root, "torch", "_native", "common_utils.py")
+
+            spec = importlib.util.spec_from_file_location("common_utils", common_utils_path)
+            common_utils = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(common_utils)
+
+            print(common_utils.check_native_jit_disabled())
         """)
         env = os.environ.copy()
         env["TORCH_DISABLE_NATIVE_JIT"] = "1"
@@ -96,9 +141,12 @@ class TestNativeDSLOps(TestCase):
 
     def test_unavailable_reason_missing(self):
         """Nonexistent package -> _unavailable_reason returns a string."""
-        from torch._native.common_utils import _unavailable_reason
-
-        reason = _unavailable_reason([("nonexistent_pkg_xyz", "nonexistent_pkg_xyz")])
+        common_utils = _import_module_directly(
+            "torch._native.common_utils", "common_utils.py"
+        )
+        reason = common_utils._unavailable_reason(
+            [("nonexistent_pkg_xyz", "nonexistent_pkg_xyz")]
+        )
         self.assertIsNotNone(reason)
         self.assertIn("nonexistent_pkg_xyz", reason)
 
@@ -106,43 +154,46 @@ class TestNativeDSLOps(TestCase):
         """_available_version returns a packaging.version.Version"""
         from packaging.version import Version
 
-        from torch._native.common_utils import _available_version
+        common_utils = _import_module_directly(
+            "torch._native.common_utils", "common_utils.py"
+        )
 
         # Use typing_extensions which always has a clean major.minor.patch version,
         # unlike torch which may have pre-release suffixes in dev builds.
-        ver = _available_version("typing_extensions")
+        ver = common_utils._available_version("typing_extensions")
         self.assertIsInstance(ver, Version)
 
     def test_registry_mechanics(self):
         """_get_library caches Library instances per (lib, dispatch_key)."""
         import torch.library
-        from torch._native.registry import _get_library, libs
+
+        registry = _import_module_directly("torch._native.registry", "registry.py")
 
         key = ("_test_native_dsl_registry", "CPU")
-        libs.pop(key, None)
+        registry._libs.pop(key, None)
 
-        lib1 = _get_library(*key)
+        lib1 = registry._get_library(*key)
         self.assertIsInstance(lib1, torch.library.Library)
-        lib2 = _get_library(*key)
+        lib2 = registry._get_library(*key)
         self.assertIs(lib1, lib2, "should return cached instance")
 
         # Different dispatch key -> different Library
         key2 = ("_test_native_dsl_registry", "CUDA")
-        libs.pop(key2, None)
-        lib3 = _get_library(*key2)
+        registry._libs.pop(key2, None)
+        lib3 = registry._get_library(*key2)
         self.assertIsNot(lib1, lib3)
 
         # cleanup
-        libs.pop(key, None)
-        libs.pop(key2, None)
+        registry._libs.pop(key, None)
+        registry._libs.pop(key2, None)
 
     def test_register_op_skips_when_jit_disabled(self):
         """register_op_override does not call through when TORCH_DISABLE_NATIVE_JIT=1."""
         script = textwrap.dedent("""\
             from unittest.mock import patch
-            from torch._native import triton_utils, cutedsl_utils
+            from torch._native import registry, triton_utils, cutedsl_utils
 
-            with patch('torch._native.registry._register_op_override') as mock_reg:
+            with patch.object(registry, '_register_op_override') as mock_reg:
                 triton_utils.register_op_override("aten", "add.Tensor", "CUDA", lambda: None)
                 cutedsl_utils.register_op_override("aten", "add.Tensor", "CUDA", lambda: None)
                 print(mock_reg.call_count == 0)
@@ -155,7 +206,7 @@ class TestNativeDSLOps(TestCase):
     def test_version_skip_env_var_overrides(self):
         """TORCH_NATIVE_SKIP_VERSION_CHECK=1 allows non-blessed versions."""
         script = textwrap.dedent("""\
-            from unittest.mock import patch, MagicMock
+            from unittest.mock import patch
             from packaging.version import Version
             from torch._native import triton_utils, cutedsl_utils
 
@@ -178,9 +229,18 @@ class TestNativeDSLOps(TestCase):
         """TORCH_NATIVE_SKIP_VERSION_CHECK unset -> returns False."""
         script = textwrap.dedent("""\
             import os
+            import importlib.util
+
             os.environ.pop("TORCH_NATIVE_SKIP_VERSION_CHECK", None)
-            from torch._native.common_utils import check_native_version_skip
-            print(check_native_version_skip())
+
+            test_dir = os.getcwd()
+            pytorch_root = os.path.dirname(os.path.dirname(test_dir))
+            common_utils_path = os.path.join(pytorch_root, "torch", "_native", "common_utils.py")
+            spec = importlib.util.spec_from_file_location("common_utils", common_utils_path)
+            common_utils = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(common_utils)
+
+            print(common_utils.check_native_version_skip())
         """)
         result = _subprocess_lastline(script)
         self.assertEqual(result, "False")
@@ -188,8 +248,17 @@ class TestNativeDSLOps(TestCase):
     def test_check_native_version_skip_set(self):
         """TORCH_NATIVE_SKIP_VERSION_CHECK=1 -> returns True."""
         script = textwrap.dedent("""\
-            from torch._native.common_utils import check_native_version_skip
-            print(check_native_version_skip())
+            import importlib.util
+            import os
+
+            test_dir = os.getcwd()
+            pytorch_root = os.path.dirname(os.path.dirname(test_dir))
+            common_utils_path = os.path.join(pytorch_root, "torch", "_native", "common_utils.py")
+            spec = importlib.util.spec_from_file_location("common_utils", common_utils_path)
+            common_utils = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(common_utils)
+
+            print(common_utils.check_native_version_skip())
         """)
         env = os.environ.copy()
         env["TORCH_NATIVE_SKIP_VERSION_CHECK"] = "1"
@@ -202,12 +271,14 @@ class TestNativeDSLOps(TestCase):
 
         from packaging.version import Version
 
-        from torch._native.common_utils import _available_version
+        common_utils = _import_module_directly(
+            "torch._native.common_utils", "common_utils.py"
+        )
 
         valid_versions = ["0.7.0rc1", "3.1.0.post1", "2.4.0a1", "1.2.3"]
         for version_str in valid_versions:
             with patch("importlib.metadata.version", return_value=version_str):
-                result = _available_version("fake_package")
+                result = common_utils._available_version("fake_package")
                 self.assertEqual(
                     result,
                     Version(version_str),
@@ -216,7 +287,7 @@ class TestNativeDSLOps(TestCase):
 
         # Completely unparsable -> None
         with patch("importlib.metadata.version", return_value="abc"):
-            result = _available_version("fake_package")
+            result = common_utils._available_version("fake_package")
             self.assertIsNone(result)
 
 

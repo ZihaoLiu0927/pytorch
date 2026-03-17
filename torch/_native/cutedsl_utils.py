@@ -9,12 +9,13 @@ from .common_utils import (
     check_native_jit_disabled,
     check_native_version_skip,
 )
-from .registry import _OpFn, _register_op_override
+from .registry import _deregister_op_overrides, _OpFn, _register_op_override
 
 
 log = logging.getLogger(__name__)
 
 
+_CUTEDSL_DSL_NAME = "cutedsl"
 _CUTEDSL_REQUIRED_VERSIONS: set[Version] = {
     # Current version - Note Version.from_part(release=(4.4.1)) is better
     #                   but > v26 of packaging.
@@ -38,7 +39,7 @@ def _check_runtime_available() -> tuple[bool, Version | None]:
         available = True
         version = _available_version("nvidia_cutlass_dsl")
     else:
-        log.info(
+        log.warning(
             "CuTeDSL operators require optional Python packages "
             "`nvidia-cutlass-dsl` and `apache-tvm-ffi`; "
             "%s",
@@ -65,13 +66,20 @@ def _version_is_ok() -> bool:
     if check_native_version_skip() or (version in _CUTEDSL_REQUIRED_VERSIONS):
         return True
 
-    log.info(
+    log.warning(
         "cutedsl version %s is not known-good (ok: %s); "
         "set TORCH_NATIVE_SKIP_VERSION_CHECK=1 to override",
         version,
         _CUTEDSL_REQUIRED_VERSIONS,
     )
     return False
+
+
+def deregister_op_overrides() -> None:
+    """
+    Deregister all ops through cuteDSL
+    """
+    _deregister_op_overrides(disable_dsl_names=_CUTEDSL_DSL_NAME)
 
 
 def register_op_override(
@@ -96,6 +104,7 @@ def register_op_override(
         return
 
     _register_op_override(
+        _CUTEDSL_DSL_NAME,
         lib_symbol,
         op_symbol,
         dispatch_key,
