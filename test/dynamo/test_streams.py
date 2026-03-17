@@ -1565,6 +1565,21 @@ class <lambda>(torch.nn.Module):
 """,
         )
 
+    @requires_cuda
+    def test_event_synchronize_inductor_lowering(self):
+        with patch("torch._inductor.config.implicit_fallbacks", False):
+
+            @torch.compile()
+            def fn(x):
+                e = torch.Event()
+                x = x + 1
+                e.record()
+                e.synchronize()
+                return x
+
+            inp = (torch.ones(2, 2, device="cuda"),)
+            fn(*inp)
+
 
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
